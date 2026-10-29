@@ -1,0 +1,7 @@
+# Cases for tests/demo_server.py. uncovered_tool intentionally has no case.
+good_tool:
+  - args: {keyword: laptop}
+null_message_tool:
+  - args: {keyword: laptop}
+nullable_tool:
+  - args: {keyword: laptop}

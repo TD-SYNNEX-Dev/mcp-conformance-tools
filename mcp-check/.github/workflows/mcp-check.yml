@@ -1,0 +1,52 @@
+name: mcp-check
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: Cases file (relative to repo root)
+        default: cases.example.yaml
+      auth_header:
+        description: Header that carries MCP_API_KEY (e.g. Authorization, X-API-Key)
+        default: Authorization
+      auth_scheme:
+        description: Key prefix; blank = Bearer for Authorization, raw key for other headers
+        default: ""
+      transport:
+        description: http (Streamable HTTP) or sse
+        default: http
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      MCP_URL: ${{ secrets.MCP_URL }}
+      MCP_API_KEY: ${{ secrets.MCP_API_KEY }}
+      MCP_AUTH_HEADER: ${{ inputs.auth_header }}
+      MCP_TRANSPORT: ${{ inputs.transport }}
+      OUT_DIR: out
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install -r requirements.txt && pip install -e .
+      - name: Inspector tools/list + mcp-check
+        run: |
+          mkdir -p out
+          if [ -n "${{ inputs.auth_scheme }}" ]; then export MCP_AUTH_SCHEME="${{ inputs.auth_scheme }}"; fi
+          ARGS=(--cases "${{ inputs.cases }}" --json out/report.json --junit out/report.junit.xml --no-wrap)
+          [ "$MCP_TRANSPORT" = "sse" ] && ARGS+=(--sse)
+          ./run-all.sh "${ARGS[@]}"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-check-report
+          path: out/

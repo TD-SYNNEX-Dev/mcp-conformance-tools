@@ -1,0 +1,762 @@
+/**
+ * The TUI's Skills pane — the SEP-2640 catalog in a terminal (#2248).
+ *
+ * **Why the TUI owns a pane rather than reusing the web screen's logic.** It
+ * does reuse everything that decides an answer: `checkSkillConformance`,
+ * `checkSkillNameCollisions` and `verifySkills` all live in `core/` and are
+ * driven identically here, so a verdict cannot differ depending on which client
+ * you asked. What is local is presentation, and the terminal's constraints are
+ * genuinely different — two panes in 80 columns, no colour to rely on, and a
+ * keyboard rather than a pointer.
+ *
+ * ⚠️ **Severity is carried by a glyph as well as a colour** (`✓` / `!` / `✗`).
+ * This pane is read over ssh, inside tmux, and piped through `script(1)`, where
+ * colour may not survive; a row whose only signal was `red` would then be
+ * indistinguishable from a clean one.
+ *
+ * The pane is shown only when the connected server declares the extension —
+ * that gate, and the reset that leaves the tab when it goes false, live in
+ * `App.tsx` because they are navigation concerns rather than this pane's.
+ */
+import React, {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
+import { Box, Text, useInput, type Key } from "ink";
+import { ScrollView, type ScrollViewRef } from "ink-scroll-view";
+import type { InspectorClient } from "@inspector/core/mcp/index.js";
+import { AuthRecoveryRequiredError } from "@inspector/core/auth/challenge.js";
+import {
+  checkSkillConformance,
+  checkSkillNameCollisions,
+  skillDisplayName,
+  skillEntryKey,
+  skillUriIdentity,
+  type SkillIssue,
+} from "@inspector/core/mcp/skills.js";
+import {
+  DYNAMIC_RESOURCES,
+  type SkillEntry,
+} from "@inspector/core/mcp/skillsSchemas.js";
+import {
+  verifySkills,
+  type SkillBudgetHint,
+  type SkillFileReport,
+  type SkillVerifyReport,
+} from "@inspector/core/mcp/skillsVerification.js";
+import { useSelectableList } from "../hooks/useSelectableList.js";
+import { errorMessage } from "../utils/errorText.js";
+import { useListFilter } from "../hooks/useListFilter.js";
+import {
+  ListFilterBar,
+  LIST_FILTER_ROWS,
+  filterCount,
+} from "./ListFilterBar.js";
+
+interface SkillsTabProps {
+  skills: SkillEntry[];
+  /** Pages the last `skills/list` walk took; shown so pagination is visible. */
+  pageCount: number;
+  /** A failed list walk, rendered in place of the list. */
+  loadError?: Error | null;
+  inspectorClient: InspectorClient | null;
+  width: number;
+  height: number;
+  focusedPane?: "list" | "details" | null;
+  onAuthRecoveryRequired?: (error: AuthRecoveryRequiredError) => void;
+  modalOpen?: boolean;
+  /** Told when the list filter starts or stops capturing keys (#2430). */
+  onFilterEditingChange?: (editing: boolean) => void;
+  /** Told when a kept list filter starts or stops claiming Esc (#2647). */
+  onFilterEscapeClaimChange?: (claimed: boolean) => void;
+}
+
+/**
+ * What the `/` filter matches a skill against (#2430): the name the row
+ * shows, and the declared frontmatter name when that differs from it.
+ */
+function skillFilterFields(
+  skill: SkillEntry,
+): ReadonlyArray<string | undefined> {
+  return [skillDisplayName(skill), skill.frontmatter.name];
+}
+
+/**
+ * The character that leads a finding line, by severity. A terminal pane cannot
+ * lean on colour alone — the Inspector is run over ssh, in tmux, and piped
+ * through `script(1)` — so severity is carried by a glyph as well as a colour.
+ */
+const ISSUE_MARK: Record<SkillIssue["severity"], string> = {
+  error: "✗",
+  warning: "!",
+};
+
+const ISSUE_COLOR: Record<SkillIssue["severity"], string> = {
+  error: "red",
+  warning: "yellow",
+};
+
+/** Per-file verification glyph, same reasoning as {@link ISSUE_MARK}. */
+const FILE_MARK: Record<string, string> = {
+  verified: "✓",
+  mismatch: "✗",
+  unverifiable: "?",
+  error: "✗",
+  "read-error": "✗",
+};
+
+const FILE_COLOR: Record<string, string> = {
+  verified: "green",
+  mismatch: "red",
+  unverifiable: "yellow",
+  error: "red",
+  "read-error": "red",
+};
+
+/**
+ * The pane's remedies for a skill `v` left unread under the catalog budget
+ * (#2633): the TUI raises it with its launch flags, and verifies one skill with
+ * Enter — which always reads that skill in full, since a run of one is never
+ * past the budget.
+ */
+const TUI_SKILL_BUDGET_HINT: SkillBudgetHint = {
+  raise:
+    "with --skill-catalog-max-skills / --skill-catalog-max-bytes at launch",
+  verifyOne: "by selecting it and pressing Enter",
+};
+
+/**
+ * The status line for each verification outcome.
+ *
+ * A `Record` over the union rather than a chain of ternaries, so adding an
+ * outcome is a type error here instead of a silently missing label — which is
+ * exactly how `unverifiable` (#2405) was caught.
+ */
+const VERIFY_STATUS: Record<SkillVerifyReport["outcome"], string> = {
+  verified: "[Verified — Enter to re-verify]",
+  unverifiable: "[UNVERIFIABLE — Enter to re-verify]",
+  incomplete: "[Verification INCOMPLETE — Enter to re-verify]",
+  failed: "[Verification FAILED — Enter to re-verify]",
+};
+
+/**
+ * The explanation printed under a failed file row.
+ *
+ * `verifySkillResource` sets `reason` for a SIZE mismatch but not for a digest
+ * one — that carries `expectedDigest` / `actualDigest` instead — so a pane that
+ * rendered only `reason` showed a bare `✗ notes.md` and never said why, leaving
+ * the failure unactionable (Copilot). Digests are truncated because the pane is
+ * 40-odd columns wide and the first bytes are enough to see that two differ;
+ * the CLI report carries them in full.
+ */
+function failureDetail(file: SkillFileReport): string | undefined {
+  if (file.reason) return file.reason;
+  if (file.status !== "mismatch") return undefined;
+  const short = (d: string | undefined) => (d ? `${d.slice(0, 23)}…` : "—");
+  return `expected ${short(file.expectedDigest)}, got ${short(file.actualDigest)}`;
+}
+
+/**
+ * Fold one run's reports into the held set (#2590).
+ *
+ * ⚠️ **The first occurrence of a key in a run wins.** A malformed listing can
+ * repeat an entry verbatim, and both copies share a `skillEntryKey`. Under a
+ * catalog budget the walk reads the first and stops before the second, so a
+ * last-write-wins merge replaced a real verdict — a digest failure, say — with
+ * the second copy's unread `incomplete` (Copilot). Identical entries are served
+ * identical bytes, so the first, read occurrence speaks for both.
+ *
+ * Verdicts for entries no longer in the listing (`live`) are dropped — held
+ * ones and this run's alike — so a pane left open across refreshes does not
+ * accumulate one per entry snapshot.
+ */
+function mergeReports(
+  previous: ReadonlyMap<string, SkillVerifyReport>,
+  entries: readonly SkillEntry[],
+  results: readonly SkillVerifyReport[],
+  live: ReadonlySet<string>,
+): Map<string, SkillVerifyReport> {
+  const next = new Map([...previous].filter(([key]) => live.has(key)));
+  const seen = new Set<string>();
+  results.forEach((result, index) => {
+    const key = skillEntryKey(entries[index]!);
+    // `live` filters this run's results too: an entry a refresh removed while
+    // the run was in flight would otherwise be cached, and its verdict would
+    // reappear unverified if the entry came back (Copilot).
+    if (seen.has(key) || !live.has(key)) return;
+    seen.add(key);
+    next.set(key, result);
+  });
+  return next;
+}
+
+/**
+ * The catalog line under the list (#2590): the hint for `v` until something has
+ * been verified, then a tally of the verdicts held for the CURRENT listing.
+ *
+ * Derived from the report map on every render rather than stored by the
+ * verify-all run, so a refresh that changes an entry drops its verdict from the
+ * tally the same way it drops it from the detail pane — a stored summary would
+ * keep counting verdicts for entries that are no longer what the server lists.
+ */
+function catalogSummary(
+  skills: readonly SkillEntry[],
+  reports: ReadonlyMap<string, SkillVerifyReport>,
+): string {
+  const counts: Record<SkillVerifyReport["outcome"], number> = {
+    verified: 0,
+    failed: 0,
+    incomplete: 0,
+    unverifiable: 0,
+  };
+  let unchecked = 0;
+  for (const skill of skills) {
+    const report = reports.get(skillEntryKey(skill));
+    if (report) counts[report.outcome] += 1;
+    else unchecked += 1;
+  }
+  if (unchecked === skills.length) return "[v: verify all]";
+  // Compact, because at an 80-column terminal the list pane has 19 columns of
+  // text (Copilot). The glyphs are the pane's own: `✓`/`✗`/`?` as in the
+  // manifest rows, `·` for not looked at, and `…` for cut short by the budget.
+  // Verified and failed always show; the rest only when non-zero.
+  const parts = [
+    `✓${counts.verified}`,
+    `✗${counts.failed}`,
+    ...(counts.incomplete > 0 ? [`…${counts.incomplete}`] : []),
+    ...(counts.unverifiable > 0 ? [`?${counts.unverifiable}`] : []),
+    ...(unchecked > 0 ? [`·${unchecked}`] : []),
+  ];
+  return parts.join(" ");
+}
+
+/** The file name a manifest URI ends in, for a list that must fit 40 columns. */
+function fileNameOf(uri: string): string {
+  const cut = uri.lastIndexOf("/");
+  return cut === -1 ? uri : uri.slice(cut + 1);
+}
+
+/**
+ * The Skills pane (SEP-2640, #2248): the catalog on the left, and on the right
+ * the selected skill's frontmatter, its conformance findings, and its manifest.
+ *
+ * **Enter verifies.** The static checks run on every render — they are a pure
+ * walk over a list already in memory — but digest verification needs the bytes,
+ * so it is one `resources/read` per manifest entry and must be asked for. That
+ * split is the same one the web screen makes and the same one SEP-2640 makes:
+ * hosts MUST NOT retrieve a skill's files ahead of need.
+ *
+ * **`v` verifies the whole listing** (#2590), in one `verifySkills` run — the
+ * same call the CLI's `--verify` makes. That is what gives the per-server
+ * catalog budget (`skillCatalogMaxSkills` / `skillCatalogMaxBytes`) something
+ * to bound here: it is a RUN-level limit, and a run of one skill always reads
+ * that skill in full. Skills past the budget come back `incomplete`, unread,
+ * and Enter on one of them verifies it on its own.
+ */
+export function SkillsTab({
+  skills,
+  pageCount,
+  loadError = null,
+  inspectorClient,
+  width,
+  height,
+  focusedPane = null,
+  onAuthRecoveryRequired,
+  modalOpen = false,
+  onFilterEditingChange,
+  onFilterEscapeClaimChange,
+}: SkillsTabProps) {
+  // One more row than the bare list: the catalog summary line (#2590).
+  const visibleCount = Math.max(1, height - 8 - LIST_FILTER_ROWS);
+  const filter = useListFilter(skills, skillFilterFields, {
+    enabled: !modalOpen && focusedPane === "list",
+    onEditingChange: onFilterEditingChange,
+    onEscapeClaimChange: onFilterEscapeClaimChange,
+  });
+  const shownSkills = filter.items;
+  const { selectedIndex, firstVisible, setSelection } = useSelectableList(
+    shownSkills.length,
+    visibleCount,
+    { resetWhen: shownSkills },
+  );
+  const [error, setError] = useState<string | null>(null);
+  const [verifying, setVerifying] = useState(false);
+  /**
+   * Every verification held, keyed by the **entry it was computed against**.
+   *
+   * Keyed rather than cleared on selection change, so moving off a skill and
+   * back does not silently discard a verdict the user just paid a round trip
+   * for. Keyed by a serialization of the entry rather than by its index, so a
+   * refresh that reorders the list cannot show one skill's verdict under
+   * another's name — and rather than by its URI alone, because a refresh can
+   * replace the manifest or the frontmatter *under the same URI*, and a
+   * URI-keyed verdict would then present hashes and findings computed for the
+   * previous snapshot as if they described the new one (Copilot).
+   *
+   * The same key the web screen uses, for the same reason: re-verifying after a
+   * metadata-only refresh is the cheap direction to be wrong in; showing a
+   * verdict computed against a different entry is not.
+   *
+   * A map rather than a single slot since verify-all (#2590): one run yields a
+   * verdict for every entry, and each must survive moving the selection.
+   */
+  const [reports, setReports] = useState<
+    ReadonlyMap<string, SkillVerifyReport>
+  >(() => new Map());
+  const scrollViewRef = useRef<ScrollViewRef>(null);
+  // The listing as of the latest commit, for a verification that resolves
+  // after it changed. A LAYOUT effect, so the ref is synchronized during the
+  // commit itself: a passive effect can run later, and a run resolving in that
+  // gap would still see a removed entry as live (Copilot).
+  const skillsRef = useRef(skills);
+  useLayoutEffect(() => {
+    skillsRef.current = skills;
+  }, [skills]);
+
+  const selectedSkill = shownSkills[selectedIndex] ?? null;
+
+  /**
+   * Verify `entries` in ONE `verifySkills` run, so the run-level catalog budget
+   * applies across them — Enter passes the selected skill, `v` the listing.
+   */
+  const runVerify = useCallback(
+    (entries: readonly SkillEntry[]) => {
+      if (!inspectorClient || verifying) return;
+      setVerifying(true);
+      setError(null);
+      // The IIFE catches everything it can throw, so there is no rejection for
+      // this key handler — which cannot await — to own.
+      void (async () => {
+        try {
+          const results = await verifySkills(
+            inspectorClient,
+            entries,
+            undefined,
+            TUI_SKILL_BUDGET_HINT,
+          );
+          // Read AFTER the run, so a listing that changed while it was in
+          // flight is the one pruned against.
+          const live = new Set(skillsRef.current.map(skillEntryKey));
+          setReports((previous) =>
+            mergeReports(previous, entries, results, live),
+          );
+        } catch (err) {
+          if (err instanceof AuthRecoveryRequiredError) {
+            onAuthRecoveryRequired?.(err);
+            return;
+          }
+          /* v8 ignore start -- `verifySkills` records an ordinary read failure
+             against the file it happened on and keeps walking, and it re-throws
+             exactly one error, handled directly above. So nothing the call
+             graph can produce reaches here; this is the guard that keeps a
+             future change from becoming an unhandled rejection instead of a
+             visible message. Exercising it would mean faking a throw the walk
+             cannot make, which tests the fake rather than the code. */
+          setError(
+            err instanceof Error ? errorMessage(err) : "Failed to verify skill",
+          );
+          /* v8 ignore stop */
+        } finally {
+          setVerifying(false);
+        }
+      })();
+    },
+    [inspectorClient, onAuthRecoveryRequired, verifying],
+  );
+
+  useInput(
+    (input: string, key: Key) => {
+      // The filter goes first: while it is editing, Enter and letters belong
+      // to the query, not to the list.
+      if (filter.handleInput(input, key)) return;
+      if (key.return && selectedSkill && inspectorClient) {
+        runVerify([selectedSkill]);
+        return;
+      }
+      // The WHOLE listing, not the filtered rows: the CLI's `--verify` covers
+      // the catalog, and the budget is sized against the catalog (#2590).
+      if (input === "v" && skills.length > 0 && inspectorClient) {
+        runVerify(skills);
+        return;
+      }
+      if (focusedPane === "list") {
+        if (key.upArrow && selectedIndex > 0) {
+          setSelection(selectedIndex - 1);
+        } else if (key.downArrow && selectedIndex < shownSkills.length - 1) {
+          setSelection(selectedIndex + 1);
+        }
+        return;
+      }
+      if (focusedPane === "details") {
+        if (key.upArrow) {
+          scrollViewRef.current?.scrollBy(-1);
+        } else if (key.downArrow) {
+          scrollViewRef.current?.scrollBy(1);
+        } else if (key.pageUp) {
+          const viewportHeight =
+            scrollViewRef.current?.getViewportHeight() || 1;
+          scrollViewRef.current?.scrollBy(-viewportHeight);
+        } else if (key.pageDown) {
+          const viewportHeight =
+            scrollViewRef.current?.getViewportHeight() || 1;
+          scrollViewRef.current?.scrollBy(viewportHeight);
+        }
+      }
+    },
+    {
+      isActive:
+        !modalOpen && (focusedPane === "list" || focusedPane === "details"),
+    },
+  );
+
+  // Reset scroll when selection changes. A genuine synchronization with an
+  // external system (the ScrollView's imperative handle), not state derived
+  // from a prop — so an effect is the right tool here.
+  useEffect(() => {
+    scrollViewRef.current?.scrollTo(0);
+  }, [selectedIndex]);
+
+  const listWidth = Math.floor(width * 0.4);
+  const detailWidth = width - listWidth;
+  // A name collision is a property of the LISTING, not of an entry, so it is
+  // computed once here and merged into each entry's own findings — which is
+  // what carries it into the row marks below as well as the detail pane.
+  const collisions = checkSkillNameCollisions(skills);
+  const findingsFor = (skill: SkillEntry): SkillIssue[] => {
+    const collision = collisions.get(skillUriIdentity(skill.uri));
+    return [...checkSkillConformance(skill), ...(collision ? [collision] : [])];
+  };
+  const issues = selectedSkill ? findingsFor(selectedSkill) : [];
+  const activeReport = selectedSkill
+    ? (reports.get(skillEntryKey(selectedSkill)) ?? null)
+    : null;
+  const manifest =
+    selectedSkill && selectedSkill.resources !== DYNAMIC_RESOURCES
+      ? selectedSkill.resources
+      : [];
+  // Compared on normalized identity, like every other URI comparison here, so a
+  // manifest entry written in an equivalent form is not reported twice.
+  const manifestIdentities = new Set(
+    manifest.map((resource) => skillUriIdentity(resource.uri)),
+  );
+  const extraReportFiles = (activeReport?.files ?? []).filter(
+    (file) => !manifestIdentities.has(skillUriIdentity(file.uri)),
+  );
+
+  return (
+    <Box flexDirection="row" width={width} height={height}>
+      <Box
+        width={listWidth}
+        height={height}
+        borderStyle="single"
+        borderTop={false}
+        borderBottom={false}
+        borderLeft={false}
+        borderRight={true}
+        flexDirection="column"
+        paddingX={1}
+      >
+        <Box paddingY={1}>
+          <Text
+            bold
+            backgroundColor={focusedPane === "list" ? "yellow" : undefined}
+          >
+            Skills (
+            {filterCount(filter.active, shownSkills.length, skills.length)}
+            {pageCount > 1 ? `, ${pageCount} pages` : ""})
+          </Text>
+        </Box>
+        <ListFilterBar
+          query={filter.query}
+          editing={filter.editing}
+          focused={focusedPane === "list" && !modalOpen}
+        />
+        <Box flexShrink={0} height={1}>
+          <Text dimColor wrap="truncate">
+            {skills.length === 0
+              ? ""
+              : verifying
+                ? "[Verifying…]"
+                : catalogSummary(skills, reports)}
+          </Text>
+        </Box>
+        {loadError ? (
+          <Box paddingY={1}>
+            <Text color="red">{errorMessage(loadError)}</Text>
+          </Box>
+        ) : skills.length === 0 ? (
+          <Box paddingY={1}>
+            <Text dimColor>No skills available</Text>
+          </Box>
+        ) : shownSkills.length === 0 ? (
+          <Box paddingY={1}>
+            <Text dimColor>No skills match the filter</Text>
+          </Box>
+        ) : (
+          <Box
+            flexDirection="column"
+            height={visibleCount}
+            overflow="hidden"
+            flexShrink={0}
+          >
+            {shownSkills
+              .slice(firstVisible, firstVisible + visibleCount)
+              .map((skill, i) => {
+                const index = firstVisible + i;
+                // Keyed by the UNFILTERED position, which stays unique even
+                // when a malformed listing repeats a URI (see below).
+                const ordinal = filter.indices[index];
+                const isSelected = index === selectedIndex;
+                // The per-row mark is the static conformance verdict, which
+                // costs nothing — it is what makes a bad skill visible in the
+                // list rather than only after selecting it.
+                const rowIssues = findingsFor(skill);
+                const worst = rowIssues.some((it) => it.severity === "error")
+                  ? "error"
+                  : rowIssues.length > 0
+                    ? "warning"
+                    : null;
+                return (
+                  // Index-keyed like the manifest and finding rows, and for
+                  // the same reason: a malformed listing can repeat a URI, and
+                  // this pane exists to show BOTH entries — a URI key would
+                  // collide them and let React drop or reuse the wrong row
+                  // (Copilot).
+                  <Box
+                    key={`${ordinal}:${skill.uri}`}
+                    paddingY={0}
+                    flexShrink={0}
+                  >
+                    <Text>
+                      {isSelected ? "▶ " : "  "}
+                      {worst ? (
+                        <Text color={ISSUE_COLOR[worst]}>
+                          {ISSUE_MARK[worst]}{" "}
+                        </Text>
+                      ) : (
+                        <Text color="green">✓ </Text>
+                      )}
+                      {skillDisplayName(skill)}
+                    </Text>
+                  </Box>
+                );
+              })}
+          </Box>
+        )}
+      </Box>
+
+      <Box
+        width={detailWidth}
+        height={height}
+        paddingX={1}
+        flexDirection="column"
+        overflow="hidden"
+      >
+        {selectedSkill ? (
+          <>
+            <Box flexShrink={0} paddingTop={1}>
+              <Text
+                bold
+                backgroundColor={
+                  focusedPane === "details" ? "yellow" : undefined
+                }
+                {...(focusedPane === "details" ? {} : { color: "cyan" })}
+              >
+                {skillDisplayName(selectedSkill)}
+              </Text>
+            </Box>
+
+            <ScrollView ref={scrollViewRef} height={height - 5}>
+              <Box marginTop={1} flexShrink={0}>
+                <Text dimColor>{selectedSkill.uri}</Text>
+              </Box>
+              {selectedSkill.frontmatter.description && (
+                <Box marginTop={1} flexShrink={0}>
+                  <Text dimColor>{selectedSkill.frontmatter.description}</Text>
+                </Box>
+              )}
+
+              {/* Named for the checks it actually covers. An unqualified
+                  "conforms" sat directly above "Verification FAILED" in the
+                  same pane and flatly contradicted it — these are the static
+                  checks against the LISTING, and passing them says nothing
+                  about the bytes the server serves (Copilot). Same wording
+                  problem, and the same fix, as the web screen's "No structural
+                  issues". */}
+              <Box marginTop={1} flexShrink={0}>
+                <Text bold>
+                  Listing checks
+                  {issues.length === 0 ? ": no structural issues" : ":"}
+                </Text>
+              </Box>
+              {issues.map((issue, idx) => (
+                <Box key={`issue-${idx}`} paddingLeft={2} flexShrink={0}>
+                  <Text color={ISSUE_COLOR[issue.severity]}>
+                    {ISSUE_MARK[issue.severity]} {issue.message}
+                  </Text>
+                </Box>
+              ))}
+
+              {/* ABOVE the manifest, because it explains the list that
+                  follows: only the first N rows were fetched, and the rest
+                  stay marked `·` because nobody looked at them. Below a
+                  512-row manifest it would be off-screen, which is the same as
+                  absent. `verifySkills` sets `incomplete` precisely so a
+                  consumer can tell "not fully checked" from a real failure
+                  (Copilot). */}
+              {activeReport?.incomplete && (
+                <>
+                  <Box marginTop={1} flexShrink={0}>
+                    <Text bold color="yellow">
+                      Incomplete:
+                    </Text>
+                  </Box>
+                  <Box paddingLeft={2} flexShrink={0}>
+                    <Text color="yellow">{activeReport.incomplete}</Text>
+                  </Box>
+                </>
+              )}
+
+              <Box marginTop={1} flexShrink={0}>
+                <Text bold>
+                  Manifest
+                  {selectedSkill.resources === DYNAMIC_RESOURCES
+                    ? ': "dynamic" — no files advertised'
+                    : ` (${manifest.length})`}
+                </Text>
+              </Box>
+              {manifest.map((resource, idx) => {
+                // Matched on normalized identity, like the membership test
+                // just above — a raw comparison misses a report row recorded
+                // under an equivalent spelling, while `extraReportFiles`
+                // suppresses it as already covered, and the verdict renders
+                // nowhere (Copilot).
+                const fileReport = activeReport?.files.find(
+                  (file) =>
+                    skillUriIdentity(file.uri) ===
+                    skillUriIdentity(resource.uri),
+                );
+                return (
+                  <Box
+                    key={`file-${idx}`}
+                    paddingLeft={2}
+                    flexShrink={0}
+                    flexDirection="column"
+                  >
+                    <Text>
+                      {fileReport ? (
+                        <Text color={FILE_COLOR[fileReport.status] ?? "white"}>
+                          {FILE_MARK[fileReport.status] ?? "?"}{" "}
+                        </Text>
+                      ) : (
+                        <Text dimColor>· </Text>
+                      )}
+                      {fileNameOf(resource.uri)}
+                      {resource.size !== undefined ? (
+                        <Text dimColor> ({resource.size} B)</Text>
+                      ) : null}
+                    </Text>
+                    {fileReport && failureDetail(fileReport) && (
+                      <Box paddingLeft={4} flexShrink={0}>
+                        <Text color="red">{failureDetail(fileReport)}</Text>
+                      </Box>
+                    )}
+                  </Box>
+                );
+              })}
+
+              {/* A report can carry a file the MANIFEST does not — a dynamic
+                  skill has no rows at all, yet a failed read of its own
+                  SKILL.md is recorded so the failure is visible. Rendering only
+                  manifest rows left "Verification FAILED" with no diagnosis
+                  anywhere on screen (Copilot). */}
+              {extraReportFiles.length > 0 && (
+                <>
+                  <Box marginTop={1} flexShrink={0}>
+                    <Text bold>Read failures:</Text>
+                  </Box>
+                  {extraReportFiles.map((file, idx) => (
+                    <Box
+                      key={`extra-${idx}`}
+                      paddingLeft={2}
+                      flexShrink={0}
+                      flexDirection="column"
+                    >
+                      <Text>
+                        <Text color={FILE_COLOR[file.status] ?? "white"}>
+                          {FILE_MARK[file.status] ?? "?"}{" "}
+                        </Text>
+                        {fileNameOf(file.uri)}
+                      </Text>
+                      {failureDetail(file) && (
+                        <Box paddingLeft={4} flexShrink={0}>
+                          <Text color="red">{failureDetail(file)}</Text>
+                        </Box>
+                      )}
+                    </Box>
+                  ))}
+                </>
+              )}
+
+              {activeReport && activeReport.frontmatter.length > 0 && (
+                <>
+                  <Box marginTop={1} flexShrink={0}>
+                    <Text bold>Frontmatter cross-check:</Text>
+                  </Box>
+                  {activeReport.frontmatter.map((issue, idx) => (
+                    <Box key={`fm-${idx}`} paddingLeft={2} flexShrink={0}>
+                      <Text color={ISSUE_COLOR[issue.severity]}>
+                        {ISSUE_MARK[issue.severity]} {issue.message}
+                      </Text>
+                    </Box>
+                  ))}
+                </>
+              )}
+
+              {error && (
+                <Box marginTop={1} flexShrink={0}>
+                  <Text color="red">{error}</Text>
+                </Box>
+              )}
+
+              <Box marginTop={1} flexShrink={0}>
+                <Text dimColor>
+                  {verifying
+                    ? "[Verifying…]"
+                    : activeReport
+                      ? // ⚠️ Switched on `outcome`, not on `ok`. `ok` stays
+                        // true for an `incomplete` report — nothing checked
+                        // was wrong — so an `ok`-first branch printed
+                        // "Verified" for a walk the read bounds cut short and
+                        // the INCOMPLETE arm was unreachable (Copilot).
+                        VERIFY_STATUS[activeReport.outcome]
+                      : "[Enter to verify digests and frontmatter]"}
+                </Text>
+              </Box>
+            </ScrollView>
+
+            {focusedPane === "details" && (
+              <Box
+                flexShrink={0}
+                height={1}
+                justifyContent="center"
+                backgroundColor="gray"
+              >
+                <Text bold color="white">
+                  ↑/↓ to scroll, Enter to verify
+                </Text>
+              </Box>
+            )}
+          </>
+        ) : (
+          <Box paddingY={1} flexShrink={0}>
+            <Text dimColor>Select a skill to view details</Text>
+          </Box>
+        )}
+      </Box>
+    </Box>
+  );
+}

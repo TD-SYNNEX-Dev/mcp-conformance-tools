@@ -1,0 +1,6 @@
+# Pinned runtime deps (same as pyproject.toml). `pip install -e .` also works.
+mcp==2.3.0
+jsonschema==4.26.0
+PyYAML==6.0.3
+# tests
+pytest==9.1.1

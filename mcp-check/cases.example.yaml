@@ -1,0 +1,15 @@
+# mcp-check cases file (YAML or JSON).
+#   <tool name>:
+#     - args: {...}            # arguments passed to tools/call (default {})
+#       expect: success|error  # default success
+#       name: optional label shown in the report
+# Tools listed by the server but absent here are reported as NOT EXERCISED (never called).
+# Only put READ-ONLY tools here when pointing at a shared environment.
+# These cases match tests/sample_bad_server.py.
+healthy_tool:
+  - args: {query: laptop}
+  - name: error result
+    args: {query: error}
+    expect: error
+wrong_type_field:
+  - args: {query: laptop}

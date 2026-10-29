@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-check"
+version = "0.1.0"
+description = "MCP server conformance check: initialize, tools/list, schema lint, and tool calls validated by the official MCP Python SDK"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "mcp==2.3.0",
+  "jsonschema==4.26.0",
+  "PyYAML==6.0.3",
+]
+
+[project.optional-dependencies]
+test = ["pytest==9.1.1"]
+
+[project.scripts]
+mcp-check = "mcp_check.cli:main"
+
+[tool.setuptools]
+packages = ["mcp_check"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

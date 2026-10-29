@@ -1,0 +1,183 @@
+/**
+ * `autoOpen` browser launch (#1959).
+ *
+ * Both servers call `openBrowser` from a synchronous callback — the prod
+ * server from `serve()`'s listen callback, the dev plugin from `logBanner` —
+ * so a rejection there has nowhere to go. On a headless or otherwise
+ * browser-less host that rejection is the *ordinary* outcome, not an edge
+ * case, and before #1959 it escaped as an unhandled rejection from a server
+ * that had already started listening and printed a perfectly usable URL.
+ *
+ * The helper is shared precisely so this behavior has one implementation to
+ * pin. The unit tests below cover it directly; the end-to-end test then
+ * proves the prod server routes through it and survives the failure. The dev
+ * plugin is not booted here — it returns early under `VITEST` by design (see
+ * `vite-hono-plugin.ts`) — but it calls the same tested helper.
+ */
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { EventEmitter } from "node:events";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { WebServerConfig } from "../../../../server/web-server-config.js";
+import type { WebServerHandle } from "../../../../server/types.js";
+
+const openMock = vi.hoisted(() => vi.fn());
+vi.mock("open", () => ({ default: openMock }));
+
+// Imported after the mock is registered so both bind to the double.
+const { openBrowser } = await import("../../../../server/web-server-config.js");
+const { startHonoServer } = await import("../../../../server/server.js");
+
+/** The one-line warning for `reason`: the message only, never the error object (#2645). */
+const warning = (reason: string) =>
+  `Could not open a browser automatically (${reason}). Open the URL above manually.`;
+
+/**
+ * A stand-in for the `ChildProcess` `open` resolves with. Since v11 `open`
+ * resolves only after the child's `'spawn'` and rejects on a spawn failure
+ * itself, so the child it hands back has already launched.
+ */
+function fakeChild(): EventEmitter {
+  return new EventEmitter();
+}
+
+/** An unhandledRejection fires on a later macrotask than the rejection. */
+async function settle() {
+  await new Promise((resolve) => setTimeout(resolve, 50));
+}
+
+const INDEX_HTML =
+  "<!doctype html><html><body><div id=root></div></body></html>";
+
+let handle: WebServerHandle | undefined;
+let staticRoot: string | undefined;
+
+afterEach(async () => {
+  await handle?.close();
+  handle = undefined;
+  if (staticRoot) await rm(staticRoot, { recursive: true, force: true });
+  staticRoot = undefined;
+  openMock.mockReset();
+  vi.restoreAllMocks();
+});
+
+describe("openBrowser", () => {
+  it("owns a rejection and warns instead of letting it go unhandled", async () => {
+    // Suppress the expected warning rather than letting it pollute the run,
+    // but assert on it — the warning IS the user-visible half of the fix.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => unhandled.push(err);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      openMock.mockRejectedValue(new Error("no browser on this host"));
+      expect(openBrowser("http://127.0.0.1:6274")).toBeUndefined();
+      await settle();
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(unhandled).toEqual([]);
+    expect(warn).toHaveBeenCalledWith(warning("no browser on this host"));
+  });
+
+  it("reports a non-Error rejection by its string form", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    openMock.mockRejectedValue("no opener");
+    openBrowser("http://127.0.0.1:6274");
+    await settle();
+    expect(warn).toHaveBeenCalledWith(warning("no opener"));
+  });
+
+  it("warns instead of crashing when the opener cannot be spawned", async () => {
+    // `open` (v11+) rejects with the child's ENOENT 'error'; before #2533 an
+    // unlistened 'error' event threw and killed the server.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Shaped like the real error: `spawnargs` carries the tokenized URL,
+    // which must not reach the terminal a second time (#2645).
+    const url = "http://127.0.0.1:6274/?MCP_INSPECTOR_API_TOKEN=secret-token";
+    const enoent = Object.assign(new Error("spawn xdg-open ENOENT"), {
+      code: "ENOENT",
+      spawnargs: [url],
+    });
+    openMock.mockRejectedValue(enoent);
+    expect(openBrowser(url)).toBeUndefined();
+    await settle();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(warning("spawn xdg-open ENOENT"));
+    expect(String(warn.mock.calls[0][0])).not.toContain("secret-token");
+  });
+
+  it("stays quiet when the browser opens", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    openMock.mockImplementation(async () => fakeChild());
+    openBrowser("http://127.0.0.1:6274");
+    await settle();
+    // `openUrl` opens the URL's serialized form, which adds the root path.
+    expect(openMock).toHaveBeenCalledWith("http://127.0.0.1:6274/");
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("startHonoServer autoOpen", () => {
+  it("keeps serving when the browser cannot be opened", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandled = (err: unknown) => unhandled.push(err);
+    process.on("unhandledRejection", onUnhandled);
+
+    try {
+      openMock.mockRejectedValue(new Error("no browser on this host"));
+
+      staticRoot = await mkdtemp(join(tmpdir(), "inspector-autoopen-"));
+      await writeFile(join(staticRoot, "index.html"), INDEX_HTML, "utf-8");
+      // Bind `:0` and let the kernel pick, so the port is owned from the
+      // moment it is chosen. Probing for a free port and binding it later
+      // leaves a window where another process on a loaded machine takes it,
+      // and the server's EADDRINUSE handler then calls process.exit(1)
+      // (#2602).
+      const config: WebServerConfig = {
+        port: 0,
+        hostname: "127.0.0.1",
+        authToken: "auto-open-token",
+        dangerouslyOmitAuth: false,
+        initialMcpConfig: null,
+        mcpConfigPath: undefined,
+        writable: true,
+        initialServers: null,
+        storageDir: undefined,
+        // The origin is unknown until the bind; this test never calls /api,
+        // which is the only surface the allow-list guards.
+        allowedOrigins: [],
+        sandboxPort: 0,
+        appOriginPort: 0,
+        sandboxHost: "127.0.0.1",
+        logger: undefined,
+        autoOpen: true,
+        staticRoot,
+      };
+      handle = await startHonoServer(config);
+
+      // `serve()`'s listen callback fires after startHonoServer resolves.
+      for (let i = 0; i < 100 && openMock.mock.calls.length === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      await settle();
+
+      // The URL handed to the opener is the banner URL, built from the port
+      // the server actually bound — so it is also where the server is.
+      expect(openMock).toHaveBeenCalledTimes(1);
+      const opened = new URL(String(openMock.mock.calls[0][0]));
+      expect(opened.hostname).toBe("127.0.0.1");
+      expect(Number(opened.port)).toBeGreaterThan(0);
+      const baseUrl = opened.origin;
+      expect(unhandled).toEqual([]);
+      expect(warn).toHaveBeenCalledWith(warning("no browser on this host"));
+      // The point of warning rather than throwing: the server is still up.
+      const res = await fetch(`${baseUrl}/`);
+      expect(res.status).toBe(200);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+});

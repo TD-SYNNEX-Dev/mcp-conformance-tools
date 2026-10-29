@@ -1,0 +1,331 @@
+import React, { useState, useEffect, useRef } from "react";
+import { Box, Text, useInput, type Key } from "ink";
+import { ScrollView, type ScrollViewRef } from "ink-scroll-view";
+import type { InspectorClient } from "@inspector/core/mcp/index.js";
+import { AuthRecoveryRequiredError } from "@inspector/core/auth/challenge.js";
+import type {
+  Prompt,
+  PromptArgument,
+  GetPromptResult,
+} from "@modelcontextprotocol/client";
+import { useSelectableList } from "../hooks/useSelectableList.js";
+import { errorMessage } from "../utils/errorText.js";
+import { useListFilter } from "../hooks/useListFilter.js";
+import {
+  ListFilterBar,
+  LIST_FILTER_ROWS,
+  filterCount,
+} from "./ListFilterBar.js";
+
+interface PromptsTabProps {
+  prompts: Prompt[];
+  inspectorClient: InspectorClient | null;
+  width: number;
+  height: number;
+  onCountChange?: (count: number) => void;
+  focusedPane?: "list" | "details" | null;
+  onViewDetails?: (prompt: Prompt & { result?: GetPromptResult }) => void;
+  onFetchPrompt?: (prompt: Prompt) => void;
+  onAuthRecoveryRequired?: (error: AuthRecoveryRequiredError) => void;
+  modalOpen?: boolean;
+  /** Told when the list filter starts or stops capturing keys (#2430). */
+  onFilterEditingChange?: (editing: boolean) => void;
+  /** Told when a kept list filter starts or stops claiming Esc (#2647). */
+  onFilterEscapeClaimChange?: (claimed: boolean) => void;
+}
+
+/** What the `/` filter matches a prompt against (#2430). */
+function promptFilterFields(prompt: Prompt): ReadonlyArray<string | undefined> {
+  return [prompt.name, prompt.title];
+}
+
+export function PromptsTab({
+  prompts,
+  inspectorClient,
+  width,
+  height,
+  focusedPane = null,
+  onViewDetails,
+  onFetchPrompt,
+  onAuthRecoveryRequired,
+  modalOpen = false,
+  onFilterEditingChange,
+  onFilterEscapeClaimChange,
+}: PromptsTabProps) {
+  const visibleCount = Math.max(1, height - 7 - LIST_FILTER_ROWS);
+  const filter = useListFilter(prompts, promptFilterFields, {
+    enabled: !modalOpen && focusedPane === "list",
+    onEditingChange: onFilterEditingChange,
+    onEscapeClaimChange: onFilterEscapeClaimChange,
+  });
+  const shownPrompts = filter.items;
+  const { selectedIndex, firstVisible, setSelection } = useSelectableList(
+    shownPrompts.length,
+    visibleCount,
+    { resetWhen: shownPrompts },
+  );
+  const [error, setError] = useState<string | null>(null);
+  const scrollViewRef = useRef<ScrollViewRef>(null);
+
+  // Handle arrow key navigation when focused
+  useInput(
+    (input: string, key: Key) => {
+      // The filter goes first: while it is editing, Enter and letters belong
+      // to the query, not to the list.
+      if (filter.handleInput(input, key)) return;
+
+      // Handle Enter key to fetch prompt (works from both list and details)
+      if (key.return && selectedPrompt && inspectorClient && onFetchPrompt) {
+        // If prompt has arguments, open modal to collect them
+        // Otherwise, fetch directly
+        if (selectedPrompt.arguments && selectedPrompt.arguments.length > 0) {
+          onFetchPrompt(selectedPrompt);
+        } else {
+          // No arguments, fetch directly. The IIFE catches everything it can
+          // throw, so there is no rejection for this key handler — which
+          // cannot await — to own.
+          void (async () => {
+            try {
+              const invocation = await inspectorClient.getPrompt(
+                selectedPrompt.name,
+              );
+              // Show result in details modal
+              if (onViewDetails) {
+                onViewDetails({
+                  ...selectedPrompt,
+                  result: invocation.result,
+                });
+              }
+            } catch (error) {
+              if (error instanceof AuthRecoveryRequiredError) {
+                onAuthRecoveryRequired?.(error);
+                return;
+              }
+              setError(
+                error instanceof Error
+                  ? errorMessage(error)
+                  : "Failed to get prompt",
+              );
+            }
+          })();
+        }
+        return;
+      }
+
+      if (focusedPane === "list") {
+        if (key.upArrow && selectedIndex > 0) {
+          setSelection(selectedIndex - 1);
+        } else if (key.downArrow && selectedIndex < shownPrompts.length - 1) {
+          setSelection(selectedIndex + 1);
+        }
+        return;
+      }
+
+      if (focusedPane === "details") {
+        // Handle '+' key to view in full screen modal
+        if (input === "+" && selectedPrompt && onViewDetails) {
+          onViewDetails(selectedPrompt);
+          return;
+        }
+
+        // Scroll the details pane using ink-scroll-view
+        if (key.upArrow) {
+          scrollViewRef.current?.scrollBy(-1);
+        } else if (key.downArrow) {
+          scrollViewRef.current?.scrollBy(1);
+        } else if (key.pageUp) {
+          const viewportHeight =
+            scrollViewRef.current?.getViewportHeight() || 1;
+          scrollViewRef.current?.scrollBy(-viewportHeight);
+        } else if (key.pageDown) {
+          const viewportHeight =
+            scrollViewRef.current?.getViewportHeight() || 1;
+          scrollViewRef.current?.scrollBy(viewportHeight);
+        }
+      }
+    },
+    {
+      isActive:
+        !modalOpen && (focusedPane === "list" || focusedPane === "details"),
+    },
+  );
+
+  // Reset scroll when selection changes
+  useEffect(() => {
+    scrollViewRef.current?.scrollTo(0);
+  }, [selectedIndex]);
+
+  const selectedPrompt = shownPrompts[selectedIndex] || null;
+
+  const listWidth = Math.floor(width * 0.4);
+  const detailWidth = width - listWidth;
+
+  return (
+    <Box flexDirection="row" width={width} height={height}>
+      {/* Prompts List */}
+      <Box
+        width={listWidth}
+        height={height}
+        borderStyle="single"
+        borderTop={false}
+        borderBottom={false}
+        borderLeft={false}
+        borderRight={true}
+        flexDirection="column"
+        paddingX={1}
+      >
+        <Box paddingY={1}>
+          <Text
+            bold
+            backgroundColor={focusedPane === "list" ? "yellow" : undefined}
+          >
+            Prompts (
+            {filterCount(filter.active, shownPrompts.length, prompts.length)})
+          </Text>
+        </Box>
+        <ListFilterBar
+          query={filter.query}
+          editing={filter.editing}
+          focused={focusedPane === "list" && !modalOpen}
+        />
+        {error ? (
+          <Box paddingY={1}>
+            <Text color="red">{error}</Text>
+          </Box>
+        ) : prompts.length === 0 ? (
+          <Box paddingY={1}>
+            <Text dimColor>No prompts available</Text>
+          </Box>
+        ) : shownPrompts.length === 0 ? (
+          <Box paddingY={1}>
+            <Text dimColor>No prompts match the filter</Text>
+          </Box>
+        ) : (
+          <Box
+            flexDirection="column"
+            height={visibleCount}
+            overflow="hidden"
+            flexShrink={0}
+          >
+            {shownPrompts
+              .slice(firstVisible, firstVisible + visibleCount)
+              .map((prompt, i) => {
+                const index = firstVisible + i;
+                const isSelected = index === selectedIndex;
+                // Unfiltered position: unique even across repeated names.
+                const ordinal = filter.indices[index];
+                return (
+                  <Box
+                    key={`${ordinal}:${prompt.name}`}
+                    paddingY={0}
+                    flexShrink={0}
+                  >
+                    <Text>
+                      {isSelected ? "▶ " : "  "}
+                      {prompt.name || `Prompt ${ordinal + 1}`}
+                    </Text>
+                  </Box>
+                );
+              })}
+          </Box>
+        )}
+      </Box>
+
+      {/* Prompt Details */}
+      <Box
+        width={detailWidth}
+        height={height}
+        paddingX={1}
+        flexDirection="column"
+        overflow="hidden"
+      >
+        {selectedPrompt ? (
+          <>
+            {/* Fixed header */}
+            <Box flexShrink={0} paddingTop={1}>
+              <Text
+                bold
+                backgroundColor={
+                  focusedPane === "details" ? "yellow" : undefined
+                }
+                {...(focusedPane === "details" ? {} : { color: "cyan" })}
+              >
+                {selectedPrompt.name}
+              </Text>
+            </Box>
+
+            {/* Scrollable content area - direct ScrollView with height prop like NotificationsTab */}
+            <ScrollView ref={scrollViewRef} height={height - 5}>
+              {/* Description */}
+              {selectedPrompt.description && (
+                <>
+                  {selectedPrompt.description
+                    .split("\n")
+                    .map((line: string, idx: number) => (
+                      <Box
+                        key={`desc-${idx}`}
+                        marginTop={idx === 0 ? 1 : 0}
+                        flexShrink={0}
+                      >
+                        <Text dimColor>{line}</Text>
+                      </Box>
+                    ))}
+                </>
+              )}
+
+              {/* Arguments */}
+              {selectedPrompt.arguments &&
+                selectedPrompt.arguments.length > 0 && (
+                  <>
+                    <Box marginTop={1} flexShrink={0}>
+                      <Text bold>Arguments:</Text>
+                    </Box>
+                    {selectedPrompt.arguments.map(
+                      (arg: PromptArgument, idx: number) => (
+                        <Box
+                          key={`arg-${idx}`}
+                          marginTop={1}
+                          paddingLeft={2}
+                          flexShrink={0}
+                        >
+                          <Text dimColor>
+                            - {arg.name}:{" "}
+                            {arg.description ??
+                              (arg as { type?: string }).type ??
+                              "string"}
+                          </Text>
+                        </Box>
+                      ),
+                    )}
+                  </>
+                )}
+
+              {/* Enter to Get Prompt message */}
+              <Box marginTop={1} flexShrink={0}>
+                <Text dimColor>[Enter to Get Prompt]</Text>
+              </Box>
+            </ScrollView>
+
+            {/* Fixed footer - only show when details pane is focused */}
+            {focusedPane === "details" && (
+              <Box
+                flexShrink={0}
+                height={1}
+                justifyContent="center"
+                backgroundColor="gray"
+              >
+                <Text bold color="white">
+                  ↑/↓ to scroll, + to zoom
+                </Text>
+              </Box>
+            )}
+          </>
+        ) : (
+          <Box paddingY={1} flexShrink={0}>
+            <Text dimColor>Select a prompt to view details</Text>
+          </Box>
+        )}
+      </Box>
+    </Box>
+  );
+}
