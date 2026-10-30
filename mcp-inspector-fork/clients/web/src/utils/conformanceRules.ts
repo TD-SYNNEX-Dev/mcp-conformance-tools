@@ -16,7 +16,10 @@
  * - null sweep: every null the schema does not allow, at every depth.
  * - auto-cases: minimal args from `inputSchema`; tools whose names or
  *   annotations suggest side effects are never auto-called (only when you
- *   run that one tool yourself and confirm).
+ *   run that one tool yourself and confirm). Values come from the schema
+ *   (const/default/enum/examples, format, pattern), else from description or
+ *   name hints (marked as guessed); a required value that would only be the
+ *   "test" placeholder skips the tool.
  * - the cases file format (YAML/JSON: tool -> list of {args, expect, name}).
  *
  * Pure functions only. No React, no client.
@@ -293,6 +296,7 @@ export function lintSchema(
         });
       }
     }
+    if (kind === "inputSchema") out.push(...hintFindings(kind, path, node));
     const req = node.required;
     const props = node.properties;
     if (Array.isArray(req) && isObj(props)) {
@@ -312,6 +316,56 @@ export function lintSchema(
     }
   }
   return out;
+}
+
+function isStringNode(node: Schema): boolean {
+  const t = node.type;
+  return t === "string" || (Array.isArray(t) && t.includes("string"));
+}
+
+/** Description-only constraints: allowed values or a date format the schema doesn't state. */
+function hintFindings(
+  kind: Finding["schema"],
+  path: string,
+  node: Schema,
+): Finding[] {
+  const desc = node.description;
+  if (
+    typeof desc !== "string" ||
+    !isStringNode(node) ||
+    "enum" in node ||
+    "const" in node
+  )
+    return [];
+  const vals = enumHint(desc);
+  if (vals) {
+    const listed = vals.map((v) => JSON.stringify(v)).join(", ");
+    return [
+      {
+        schema: kind,
+        severity: "warn",
+        path: `${path}/description`,
+        message: `The description lists allowed values (${listed}), but the schema has no "enum", so clients and test tools can't see them. Fix: add "enum": [${listed}].`,
+      },
+    ];
+  }
+  if ("format" in node || "pattern" in node) return [];
+  const dh = dateFormatHint(desc);
+  let what: string;
+  let fmt = "";
+  if (dh) {
+    what = dh[0];
+    fmt = ` (${dh[1]}${dh[2]})`;
+  } else if (datetimeHint(desc)) what = "date-time";
+  else return [];
+  return [
+    {
+      schema: kind,
+      severity: "warn",
+      path: `${path}/description`,
+      message: `The description asks for a ${what}${fmt}, but the schema has no "format" or "pattern", so clients and test tools can't see it. Fix: add "format": "${what}" (or a "pattern").`,
+    },
+  ];
 }
 
 export function lintTool(tool: ToolLike): Finding[] {
@@ -626,6 +680,8 @@ export interface TestCase {
   /** success | error | any (any = auto-case: only a schema mismatch FAILs) */
   expect: "success" | "error" | "any";
   name?: string;
+  /** auto-cases: values guessed from a description or name (shown in the row) */
+  guessed?: GuessedValue[];
 }
 
 export class CasesError extends Error {}
@@ -767,15 +823,436 @@ export const NO_CASE_DETAIL =
 
 export class AutoCaseError extends Error {}
 
+// Sample values per JSON Schema "format" ({today} is today's UTC date, YYYY-MM-DD). Same table as mcp-check.
 const FORMATS: Record<string, string> = {
-  date: "2026-01-01",
-  "date-time": "2026-01-01T00:00:00Z",
+  date: "{today}",
+  "date-time": "{today}T00:00:00Z",
   time: "00:00:00Z",
+  duration: "P1D",
   email: "test@example.com",
+  "idn-email": "test@example.com",
+  hostname: "example.com",
+  "idn-hostname": "example.com",
+  ipv4: "192.0.2.1",
+  ipv6: "2001:db8::1",
   uri: "https://example.com",
+  "uri-reference": "https://example.com",
+  iri: "https://example.com",
+  "iri-reference": "https://example.com",
+  "uri-template": "https://example.com/{id}",
   url: "https://example.com",
   uuid: "00000000-0000-4000-8000-000000000000",
+  "json-pointer": "/a",
+  "relative-json-pointer": "0",
+  regex: ".*",
 };
+const NO_HINT = "no enum, format, pattern, examples or description hint";
+
+/** A required value would only be the "test" placeholder (the tool is skipped, not called). */
+export class PlaceholderError extends AutoCaseError {}
+
+const own = (o: object, k: string) =>
+  Object.prototype.hasOwnProperty.call(o, k);
+
+// ----------------------------------------------------------------- description / name hints
+// Mirror of mcp-check's hints.py (same regexes, same order). Generic heuristics only.
+
+const ENUM_LEAD =
+  /(?:\benum\b|\bone of\b|\b(?:allowed|possible|valid|accepted|supported|permitted) values?\b)\s*(?:is|are)?\s*[:=]?\s*/i;
+const ENUM_TOKEN = /^[A-Za-z0-9_.:+-]+$/;
+const QUOTES = "\"'`\u2018\u2019\u201c\u201d()[]{}";
+const DATE_PART = "(y{4}|y{2}|m{1,2}|d{1,2})";
+const DATE_TOKEN_SRC = `${DATE_PART}([-/.]?)${DATE_PART}\\2${DATE_PART}`;
+const DATE_TOKEN = new RegExp(
+  `(?<![A-Za-z0-9])${DATE_TOKEN_SRC}(?![A-Za-z0-9])`,
+  "gi",
+);
+const DATE_TOKEN_FULL = new RegExp(`^${DATE_TOKEN_SRC}$`, "i");
+const TIME_TAIL = /^(\s*'T'\s*|\s*T\s*|\s+)(hh?):mm(:ss)?/i;
+const DATETIME =
+  /\biso[\s_-]?8601\b|\bdate[\s_-]?time\b|\brfc[\s_-]?3339\b|\btimestamps?\b/i;
+const NOT_ISO = /\b(?:unix|epoch)\b/i;
+const NAME_TOKENS = /[A-Z]+(?=[A-Z][a-z])|[A-Z]?[a-z0-9]+|[A-Z]+/g;
+const NOT_DATE = new Set([
+  "candidate",
+  "candidates",
+  "validate",
+  "update",
+  "updates",
+  "mandate",
+  "mandates",
+  "consolidate",
+  "accommodate",
+  "liquidate",
+]);
+const NOT_TIME = new Set([
+  "runtime",
+  "uptime",
+  "lifetime",
+  "overtime",
+  "onetime",
+  "anytime",
+]);
+const TEXT_NAMES = new Set([
+  "q",
+  "query",
+  "keyword",
+  "keywords",
+  "search",
+  "searchterm",
+  "searchtext",
+  "searchquery",
+  "term",
+  "terms",
+  "text",
+  "freetext",
+]);
+const RANGE = new Set([
+  "start",
+  "end",
+  "from",
+  "to",
+  "begin",
+  "since",
+  "until",
+  "after",
+  "before",
+]);
+
+function stripChars(s: string, chars: string): string {
+  let a = 0;
+  let b = s.length;
+  while (a < b && chars.includes(s[a])) a++;
+  while (b > a && chars.includes(s[b - 1])) b--;
+  return s.slice(a, b);
+}
+
+/** Values a description lists as allowed ("Enum: a, b"), or null. */
+export function enumHint(description: unknown): string[] | null {
+  if (typeof description !== "string") return null;
+  const m = ENUM_LEAD.exec(description);
+  if (!m) return null;
+  let rest = description.slice(m.index + m[0].length);
+  const lead = /^[^:.;\n]{0,40}:\s*/.exec(rest); // "one of the following: a, b"
+  if (lead) rest = rest.slice(lead[0].length);
+  rest = rest.split(/\.\s|\.$|;|\n/)[0];
+  const vals: string[] = [];
+  for (const raw of rest.split(/,|\||\/|\bor\b|\band\b/)) {
+    const v = stripChars(raw.trim(), QUOTES).trim();
+    if (!v) continue;
+    if (!ENUM_TOKEN.test(v)) break;
+    vals.push(v);
+  }
+  return vals.length ? vals : null;
+}
+
+/** [kind, date token, time tail] for the first date-format token in the text, or null. */
+export function dateFormatHint(
+  description: unknown,
+): ["date" | "date-time", string, string] | null {
+  if (typeof description !== "string") return null;
+  for (const m of description.matchAll(DATE_TOKEN)) {
+    const kinds = new Set([m[1], m[3], m[4]].map((g) => g[0].toLowerCase()));
+    if (kinds.size !== 3) continue;
+    const tail = TIME_TAIL.exec(
+      description.slice((m.index ?? 0) + m[0].length),
+    );
+    return [tail ? "date-time" : "date", m[0], tail ? tail[0] : ""];
+  }
+  return null;
+}
+
+/** Render a date token like "dd/MM/yyyy" (plus an optional time tail) for `today` (YYYY-MM-DD). */
+export function renderDateFormat(
+  token: string,
+  tail: string,
+  today: string,
+): string {
+  const y = today.slice(0, 4);
+  const mo = today.slice(5, 7);
+  const d = today.slice(8, 10);
+  const m = DATE_TOKEN_FULL.exec(token);
+  if (!m) throw new AutoCaseError(`not a date token: ${token}`);
+  const parts = [m[1], m[3], m[4]].map((g) => {
+    const k = g[0].toLowerCase();
+    return k === "y" ? (g.length === 4 ? y : y.slice(2)) : k === "m" ? mo : d;
+  });
+  let out = parts.join(m[2]);
+  if (tail) {
+    const t = TIME_TAIL.exec(tail);
+    if (t)
+      out +=
+        (t[1].toLowerCase().includes("t") ? "T" : " ") +
+        "00:00" +
+        (t[3] ? ":00" : "");
+  }
+  return out;
+}
+
+/** True if the text asks for an ISO 8601 / RFC 3339 date-time or a timestamp (not a Unix/epoch one). */
+export function datetimeHint(description: unknown): boolean {
+  return (
+    typeof description === "string" &&
+    DATETIME.test(description) &&
+    !NOT_ISO.test(description)
+  );
+}
+
+function nameTokens(name: string): string[] {
+  return (name.match(NAME_TOKENS) ?? []).map((t) => t.toLowerCase());
+}
+
+/** "date-time", "date" or "text" (a free-text search field) from a property name, or null. */
+export function nameKind(name: string): "date" | "date-time" | "text" | null {
+  const toks = nameTokens(name);
+  if (
+    toks.some(
+      (t) =>
+        t === "time" ||
+        t === "timestamp" ||
+        t === "datetime" ||
+        ((t.endsWith("time") || t.endsWith("timestamp")) && !NOT_TIME.has(t)),
+    )
+  )
+    return "date-time";
+  if (
+    toks.length >= 2 &&
+    toks[toks.length - 1] === "at" &&
+    toks[toks.length - 2].endsWith("ed")
+  )
+    return "date-time"; // createdAt, updated_at
+  if (
+    toks.some(
+      (t) => (t.startsWith("date") || t.endsWith("date")) && !NOT_DATE.has(t),
+    )
+  )
+    return "date";
+  if (toks.some((t) => TEXT_NAMES.has(t))) return "text";
+  return null;
+}
+
+/** Name with its one range word (start/end, from/to, ...) removed; null if it has none. */
+export function rangeKey(name: string): string | null {
+  const toks = nameTokens(name);
+  const hits = toks.flatMap((t, i) => (RANGE.has(t) ? [i] : []));
+  if (hits.length !== 1) return null;
+  return toks.filter((_, i) => i !== hits[0]).join("_");
+}
+
+// ----------------------------------------------------------------- pattern -> sample
+// Literals, escapes (\d \w \s ...), classes, groups, alternation (first branch) and quantifiers
+// (their minimum). Lookarounds, backreferences and \p{..} are not supported (null). The sample is
+// always re-checked against the pattern. Mirror of mcp-check's pattern_sample.
+
+const CLASS_ESC: Record<string, string> = {
+  d: "0-9",
+  w: "a-zA-Z0-9_",
+  s: " ",
+};
+const ATOM_ESC: Record<string, string> = {
+  d: "0",
+  D: "a",
+  w: "a",
+  W: "-",
+  s: " ",
+  S: "a",
+  n: "\n",
+  t: "\t",
+  r: "\r",
+  f: "\f",
+  v: "\v",
+};
+const NEG_CANDIDATES = "aA0_- .x";
+const QUANT = /^\{(\d+)(,\d*)?\}/;
+
+class Unsupported extends Error {}
+
+const atomEsc = (e: string) => (own(ATOM_ESC, e) ? ATOM_ESC[e] : e);
+
+function classItems(
+  p: string,
+  i0: number,
+): [Array<[string, string]>, boolean, number] {
+  let i = i0;
+  const neg = i < p.length && p[i] === "^";
+  if (neg) i++;
+  const items: Array<[string, string]> = [];
+  let first = true;
+  while (i < p.length && (p[i] !== "]" || first)) {
+    first = false;
+    const c = p[i];
+    let ch: string;
+    if (c === "\\") {
+      if (i + 1 >= p.length) throw new Unsupported();
+      const e = p[i + 1];
+      i += 2;
+      if (own(CLASS_ESC, e)) {
+        const spec = CLASS_ESC[e];
+        for (let j = 0; j < spec.length; ) {
+          if (j + 2 < spec.length && spec[j + 1] === "-") {
+            items.push([spec[j], spec[j + 2]]);
+            j += 3;
+          } else {
+            items.push([spec[j], spec[j]]);
+            j += 1;
+          }
+        }
+        continue;
+      }
+      if ("DWSpP".includes(e)) throw new Unsupported();
+      ch = atomEsc(e);
+    } else {
+      ch = c;
+      i += 1;
+    }
+    if (i + 1 < p.length && p[i] === "-" && p[i + 1] !== "]") {
+      let hi = p[i + 1];
+      if (hi === "\\") {
+        if (i + 2 >= p.length) throw new Unsupported();
+        hi = atomEsc(p[i + 2]);
+        i += 3;
+      } else i += 2;
+      items.push([ch, hi]);
+    } else items.push([ch, ch]);
+  }
+  if (i >= p.length) throw new Unsupported();
+  return [items, neg, i + 1];
+}
+
+function quant(p: string, i0: number): [number, number] {
+  let i = i0;
+  if (i >= p.length) return [1, i];
+  const c = p[i];
+  let n: number;
+  if (c === "*" || c === "?") {
+    n = 0;
+    i += 1;
+  } else if (c === "+") {
+    n = 1;
+    i += 1;
+  } else if (c === "{") {
+    const m = QUANT.exec(p.slice(i));
+    if (!m) return [1, i];
+    n = Number(m[1]);
+    i += m[0].length;
+  } else return [1, i];
+  if (i < p.length && (p[i] === "?" || p[i] === "+")) i += 1;
+  return [Math.min(n, 1000), i];
+}
+
+function alt(p: string, i0: number): [string, number] {
+  let first: string | null = null;
+  let i = i0;
+  for (;;) {
+    const [s, j] = seq(p, i);
+    i = j;
+    if (first === null) first = s;
+    if (i < p.length && p[i] === "|") {
+      i += 1;
+      continue;
+    }
+    return [first, i];
+  }
+}
+
+function seq(p: string, i0: number): [string, number] {
+  let out = "";
+  let i = i0;
+  while (i < p.length && p[i] !== "|" && p[i] !== ")") {
+    const c = p[i];
+    if (c === "^" || c === "$") {
+      i += 1;
+      continue;
+    }
+    if ("*+?".includes(c) || (c === "{" && QUANT.test(p.slice(i))))
+      throw new Unsupported();
+    let atom: string;
+    if (c === "(") {
+      i += 1;
+      if (p.startsWith("?:", i)) i += 2;
+      else if (
+        p.startsWith("?<", i) &&
+        !p.startsWith("?<=", i) &&
+        !p.startsWith("?<!", i)
+      ) {
+        const close = p.indexOf(">", i);
+        if (close < 0) throw new Unsupported();
+        i = close + 1;
+      } else if (i < p.length && p[i] === "?") throw new Unsupported();
+      [atom, i] = alt(p, i);
+      if (i >= p.length || p[i] !== ")") throw new Unsupported();
+      i += 1;
+    } else if (c === "[") {
+      const [items, neg, j] = classItems(p, i + 1);
+      i = j;
+      if (neg) {
+        const pick = [...NEG_CANDIDATES].find(
+          (ch) => !items.some(([lo, hi]) => lo <= ch && ch <= hi),
+        );
+        if (pick === undefined) throw new Unsupported();
+        atom = pick;
+      } else {
+        if (!items.length) throw new Unsupported();
+        atom = items[0][0];
+      }
+    } else if (c === ".") {
+      atom = "a";
+      i += 1;
+    } else if (c === "\\") {
+      if (i + 1 >= p.length) throw new Unsupported();
+      const e = p[i + 1];
+      i += 2;
+      if (e === "b" || e === "B") continue;
+      if (/[0-9]/.test(e) || "pPkcux".includes(e)) throw new Unsupported();
+      atom = atomEsc(e);
+    } else {
+      atom = c;
+      i += 1;
+    }
+    const [n, j] = quant(p, i);
+    i = j;
+    out += atom.repeat(n);
+  }
+  return [out, i];
+}
+
+/** A short string that matches `pattern` (JSON Schema regex, unanchored), or null. */
+export function patternSample(pattern: string): string | null {
+  try {
+    const [s, i] = alt(pattern, 0);
+    if (i !== pattern.length) return null;
+    return new RegExp(pattern, "u").test(s) ? s : null;
+  } catch {
+    return null;
+  }
+}
+
+// ----------------------------------------------------------------- value generation
+
+/** A value auto-cases took from a description or name, not from the schema itself. */
+export interface GuessedValue {
+  path: string;
+  value: unknown;
+  source: string;
+}
+
+interface Ctx {
+  today: string;
+  guessed: GuessedValue[];
+  placeholders: string[];
+  kinds: Map<string, string>;
+}
+
+const newCtx = (today: string): Ctx => ({
+  today,
+  guessed: [],
+  placeholders: [],
+  kinds: new Map(),
+});
+
+function todayUtc(): string {
+  return new Date().toISOString().slice(0, 10);
+}
 
 function resolveStrict(schema: unknown, root: unknown): unknown {
   let cur = schema;
@@ -795,7 +1272,103 @@ function resolveStrict(schema: unknown, root: unknown): unknown {
   return cur;
 }
 
-function valueFor(schemaIn: unknown, root: unknown, depth = 0): unknown {
+const firstValue = (values: unknown[]) =>
+  values.find((v) => v !== null && v !== undefined) ?? values[0];
+
+function placeholder(schema: Schema): string {
+  const n = Number(schema.minLength ?? 0);
+  const s = "test".repeat(Math.floor(n / 4) + 1).slice(0, Math.max(n, 4));
+  return s.slice(0, Number(schema.maxLength ?? 1e6));
+}
+
+function stringValue(
+  schema: Schema,
+  ctx: Ctx,
+  path: string,
+  name: string,
+): string {
+  const today = ctx.today;
+  const fmt = schema.format;
+  if (typeof fmt === "string" && own(FORMATS, fmt)) {
+    if (fmt === "date" || fmt === "date-time") ctx.kinds.set(path, fmt);
+    return FORMATS[fmt].replace("{today}", today);
+  }
+  const pat = schema.pattern;
+  if (typeof pat === "string") {
+    const s = patternSample(pat);
+    if (s === null)
+      throw new AutoCaseError(
+        `can't generate a value for ${path} that matches its pattern ${JSON.stringify(pat)}`,
+      );
+    return s;
+  }
+  const guess = (value: string, source: string, kind?: string) => {
+    ctx.guessed.push({ path, value, source });
+    if (kind) ctx.kinds.set(path, kind);
+    return value;
+  };
+  const desc = schema.description;
+  const vals = enumHint(desc);
+  if (vals) return guess(vals[0], "description lists allowed values");
+  const dh = dateFormatHint(desc);
+  if (dh) {
+    const [kind, token, tail] = dh;
+    return guess(
+      renderDateFormat(token, tail, today),
+      `description date format ${token}${tail}`,
+      kind,
+    );
+  }
+  if (datetimeHint(desc))
+    return guess(
+      `${today}T00:00:00Z`,
+      "description asks for a date-time",
+      "date-time",
+    );
+  const nk = name ? nameKind(name) : null;
+  if (nk === "date") return guess(today, "name suggests a date", "date");
+  if (nk === "date-time")
+    return guess(
+      `${today}T00:00:00Z`,
+      "name suggests a date-time",
+      "date-time",
+    );
+  if (nk === "text")
+    return guess(placeholder(schema), "name suggests free text");
+  ctx.placeholders.push(path);
+  return placeholder(schema);
+}
+
+const isNum = (v: unknown): v is number => typeof v === "number";
+
+function numberValue(schema: Schema, integer: boolean): number {
+  let lo = isNum(schema.minimum) ? schema.minimum : undefined;
+  if (isNum(schema.exclusiveMinimum))
+    lo =
+      lo !== undefined
+        ? Math.max(lo, schema.exclusiveMinimum + 1)
+        : schema.exclusiveMinimum + 1;
+  let hi = isNum(schema.maximum) ? schema.maximum : undefined;
+  if (isNum(schema.exclusiveMaximum))
+    hi =
+      hi !== undefined
+        ? Math.min(hi, schema.exclusiveMaximum - 1)
+        : schema.exclusiveMaximum - 1;
+  let v = lo ?? 1;
+  if (hi !== undefined && v > hi) v = hi;
+  const step = schema.multipleOf;
+  if (isNum(step) && step > 0) v = Math.ceil(v / step) * step;
+  return integer ? Math.trunc(v) : v;
+}
+
+function valueFor(
+  schemaIn: unknown,
+  root: unknown,
+  depth: number,
+  ctx: Ctx,
+  path: string,
+  name: string,
+): unknown {
   if (depth > 12) throw new AutoCaseError("schema nests too deeply");
   const schema = resolveStrict(schemaIn, root);
   if (schema === true || schema === undefined || schema === null) return null;
@@ -803,14 +1376,46 @@ function valueFor(schemaIn: unknown, root: unknown, depth = 0): unknown {
   if (Object.keys(schema).length === 0) return null;
   if ("const" in schema) return schema.const;
   if ("default" in schema) return schema.default;
-  if (Array.isArray(schema.enum) && schema.enum.length) return schema.enum[0];
+  if (Array.isArray(schema.enum) && schema.enum.length)
+    return firstValue(schema.enum);
   if (Array.isArray(schema.examples) && schema.examples.length)
-    return schema.examples[0];
+    return firstValue(schema.examples);
   for (const key of ["anyOf", "oneOf"]) {
     const opts = schema[key];
     if (Array.isArray(opts) && opts.length) {
       const nonNull = opts.filter((o) => !(isObj(o) && o.type === "null"));
-      return valueFor((nonNull.length ? nonNull : opts)[0], root, depth + 1);
+      let best: [unknown, Ctx] | null = null;
+      let last: unknown = null;
+      for (const o0 of nonNull.length ? nonNull : opts) {
+        let opt = resolveStrict(o0, root);
+        if (
+          isObj(opt) &&
+          !("description" in opt) &&
+          typeof schema.description === "string"
+        )
+          opt = { ...opt, description: schema.description }; // hints usually sit on the parent
+        const sub = newCtx(ctx.today);
+        let v: unknown;
+        try {
+          v = valueFor(opt, root, depth + 1, sub, path, name);
+        } catch (e) {
+          if (!(e instanceof AutoCaseError)) throw e;
+          last = e;
+          continue;
+        }
+        if (!sub.placeholders.length) {
+          best = [v, sub];
+          break;
+        }
+        if (best === null) best = [v, sub];
+      }
+      if (best === null)
+        throw last ?? new AutoCaseError("no usable anyOf/oneOf option");
+      const [v, sub] = best;
+      ctx.guessed.push(...sub.guessed);
+      ctx.placeholders.push(...sub.placeholders);
+      for (const [k, kind] of sub.kinds) ctx.kinds.set(k, kind);
+      return v;
     }
   }
   if (Array.isArray(schema.allOf) && schema.allOf.length) {
@@ -835,7 +1440,7 @@ function valueFor(schemaIn: unknown, root: unknown, depth = 0): unknown {
         else if (!(k in merged)) merged[k] = v;
       }
     }
-    return valueFor(merged, root, depth + 1);
+    return valueFor(merged, root, depth + 1, ctx, path, name);
   }
   let t = schema.type as unknown;
   if (Array.isArray(t)) t = t.find((x) => x !== "null") ?? "null";
@@ -844,34 +1449,64 @@ function valueFor(schemaIn: unknown, root: unknown, depth = 0): unknown {
     case "object": {
       const props = isObj(schema.properties) ? schema.properties : {};
       const out: Record<string, unknown> = {};
-      for (const name of (schema.required as string[]) ?? [])
-        out[name] =
-          name in props ? valueFor(props[name], root, depth + 1) : "test";
+      const req = (
+        Array.isArray(schema.required) ? schema.required : []
+      ).filter((n): n is string => typeof n === "string");
+      const child = new Map(req.map((n) => [n, path ? `${path}.${n}` : n]));
+      for (const n of req) {
+        const p = child.get(n) as string;
+        if (own(props, n))
+          out[n] = valueFor(props[n], root, depth + 1, ctx, p, n);
+        else {
+          ctx.placeholders.push(p);
+          out[n] = "test";
+        }
+      }
+      // A range (startDate/endDate, from/to, ...) gets the same value on both ends, so limits hold.
+      for (const n of req) {
+        const p = child.get(n) as string;
+        const key = rangeKey(n);
+        if (!ctx.placeholders.includes(p) || key === null) continue;
+        const partner = req.find(
+          (m) =>
+            m !== n &&
+            rangeKey(m) === key &&
+            ctx.kinds.has(child.get(m) as string),
+        );
+        if (partner !== undefined) {
+          out[n] = out[partner];
+          ctx.placeholders.splice(ctx.placeholders.indexOf(p), 1);
+          ctx.kinds.set(
+            p,
+            ctx.kinds.get(child.get(partner) as string) as string,
+          );
+          ctx.guessed.push({
+            path: p,
+            value: out[n],
+            source: `range pair with ${partner}`,
+          });
+        }
+      }
       return out;
     }
     case "array": {
       const n = Number(schema.minItems ?? 0);
-      return Array.from({ length: n }, () =>
-        valueFor(schema.items ?? {}, root, depth + 1),
+      return Array.from({ length: n }, (_, i) =>
+        valueFor(
+          schema.items ?? {},
+          root,
+          depth + 1,
+          ctx,
+          `${path}[${i}]`,
+          name,
+        ),
       );
     }
-    case "string": {
-      const f = schema.format;
-      if (typeof f === "string" && f in FORMATS) return FORMATS[f];
-      const n = Number(schema.minLength ?? 0);
-      const s = "test".repeat(Math.floor(n / 4) + 1).slice(0, Math.max(n, 4));
-      return s.slice(0, Number(schema.maxLength ?? 1e6));
-    }
+    case "string":
+      return stringValue(schema, ctx, path, name);
     case "integer":
-    case "number": {
-      let lo = schema.minimum as number | undefined;
-      if (lo === undefined && typeof schema.exclusiveMinimum === "number")
-        lo = schema.exclusiveMinimum + 1;
-      let v = lo ?? 1;
-      const hi = schema.maximum as number | undefined;
-      if (hi !== undefined && v > hi) v = hi;
-      return t === "integer" ? Math.trunc(v) : v;
-    }
+    case "number":
+      return numberValue(schema, t === "integer");
     case "boolean":
       return false;
     default:
@@ -879,29 +1514,75 @@ function valueFor(schemaIn: unknown, root: unknown, depth = 0): unknown {
   }
 }
 
-/** Required properties only, smallest plausible values; throws if the result would not validate. */
-/** Pretty JSON of the smallest valid args for a tool (the single-tool editor's starting point), or "{}". */
-export function generatedArgsText(tool: ToolLike): string {
-  try {
-    return JSON.stringify(minimalArgs(tool.inputSchema), null, 2);
-  } catch {
-    return "{}";
-  }
+export interface AutoArgs {
+  args: Record<string, unknown>;
+  /** values taken from a description or name ({path, value, source}) */
+  guessed: GuessedValue[];
 }
 
-export function minimalArgs(inputSchema: unknown): Record<string, unknown> {
+/**
+ * Required properties only, each with the most realistic value the schema allows (same rules as
+ * mcp-check's build_args). Throws PlaceholderError if a required value would only be the "test"
+ * placeholder (unless allowPlaceholders), and AutoCaseError if the args can't be built or don't validate.
+ */
+export function buildAutoArgs(
+  inputSchema: unknown,
+  opts: { today?: string; allowPlaceholders?: boolean } = {},
+): AutoArgs {
   if (!isObj(inputSchema))
     throw new AutoCaseError("inputSchema is not an object");
-  let args = valueFor(inputSchema, inputSchema);
+  const ctx = newCtx(opts.today ?? todayUtc());
+  let args = valueFor(inputSchema, inputSchema, 0, ctx, "", "");
   if (args === null) args = {};
   if (!isObj(args))
     throw new AutoCaseError("inputSchema does not describe an object");
+  if (ctx.placeholders.length && !opts.allowPlaceholders)
+    throw new PlaceholderError(
+      `can't build a realistic value for ${ctx.placeholders.join(", ")} (${NO_HINT})`,
+    );
   const errs = schemaErrors(inputSchema, args);
   if (errs.length)
     throw new AutoCaseError(
       `the generated args do not validate at ${errs[0].path}: ${errs[0].message}`,
     );
-  return args;
+  return { args, guessed: ctx.guessed };
+}
+
+/** Required properties only, most realistic values; throws if they can't be built or would not validate. */
+export function minimalArgs(
+  inputSchema: unknown,
+  opts: { today?: string; allowPlaceholders?: boolean } = {},
+): Record<string, unknown> {
+  return buildAutoArgs(inputSchema, opts).args;
+}
+
+/**
+ * The single-tool editor's starting point: the generated args (a "test" placeholder is allowed
+ * here, since you can edit it) and what was guessed, or {} if nothing valid can be built.
+ */
+export function generatedArgs(tool: ToolLike): AutoArgs {
+  try {
+    return buildAutoArgs(tool.inputSchema, { allowPlaceholders: true });
+  } catch {
+    return { args: {}, guessed: [] };
+  }
+}
+
+/** Pretty JSON of generatedArgs(tool).args. */
+export function generatedArgsText(tool: ToolLike): string {
+  return JSON.stringify(generatedArgs(tool).args, null, 2);
+}
+
+/** Row-detail note for values guessed from a description or name (same text as mcp-check). */
+export function guessedNote(guessed: GuessedValue[] | undefined): string {
+  if (!guessed?.length) return "";
+  return (
+    " Values guessed from the description or name: " +
+    guessed
+      .map((g) => `${g.path} = ${JSON.stringify(g.value)} (${g.source})`)
+      .join(", ") +
+    "."
+  );
 }
 
 export function autoCase(
@@ -912,15 +1593,21 @@ export function autoCase(
   const reason = autoEligibility(tool, allow, deny);
   if (reason) return { testCase: null, reason };
   try {
-    const args = minimalArgs(tool.inputSchema ?? { type: "object" });
+    const { args, guessed } = buildAutoArgs(
+      tool.inputSchema ?? { type: "object" },
+    );
     return {
-      testCase: { tool: tool.name, args, expect: "any", name: "auto" },
+      testCase: { tool: tool.name, args, expect: "any", name: "auto", guessed },
       reason: "",
     };
   } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
     return {
       testCase: null,
-      reason: `it could not build valid args (${e instanceof Error ? e.message : String(e)})`,
+      reason:
+        e instanceof PlaceholderError
+          ? `it ${msg}`
+          : `it could not build valid args (${msg})`,
     };
   }
 }
@@ -961,12 +1648,13 @@ export function evaluateCall(
     expect: testCase.expect,
     output_schema: schema ?? null,
   };
+  if (testCase.guessed?.length) data.guessed_args = testCase.guessed;
   const row = (status: Status, detail: string): Row => ({
     tool: tool.name,
     check: label,
     status,
     ms: outcome.ms,
-    detail,
+    detail: detail + guessedNote(testCase.guessed),
     data,
   });
   const auto = testCase.expect === "any";

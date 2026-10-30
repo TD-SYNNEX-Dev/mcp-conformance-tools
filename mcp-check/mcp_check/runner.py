@@ -22,7 +22,8 @@ import anyio
 from jsonschema.validators import validator_for
 from mcp import ClientSession
 
-from mcp_check.auto_cases import NO_CASE_DETAIL, AutoCaseError, auto_case, minimal_args, not_called_detail, side_effect_reason
+from mcp_check.auto_cases import (NO_CASE_DETAIL, AutoCaseError, PlaceholderError, auto_case, build_args, guessed_note,
+                                  not_called_detail, side_effect_reason)
 from mcp_check.cases import Case
 from mcp_check.detail import result_view
 from mcp_check.explain import STRICT, js, mismatch_detail, null_sweep_detail, schema_issues
@@ -403,21 +404,26 @@ def _single_tool_cases(tool: dict[str, Any], opts: Options) -> tuple[list[Case] 
     at the interactive prompt; cases-file cases are always explicit, so they need no confirmation.
     """
     name = tool["name"]
+    why = side_effect_reason(tool, opts.auto_deny)
+    side_effect_detail = (f"Not called: {why}, so it may change data. To call it anyway, run it on its own "
+                          "and confirm (--confirm-side-effects).")
     if opts.tool_args is not None:
         cases = [Case(tool=name, args=opts.tool_args, expect="success", name="args")]
     elif opts.cases.get(name):
         return opts.cases[name], ""
     else:
         try:
-            cases = [Case(tool=name, args=minimal_args(tool.get("inputSchema") or {"type": "object"}),
-                          expect="any", name="auto")]
+            args, guessed = build_args(tool.get("inputSchema") or {"type": "object"})
+            cases = [Case(tool=name, args=args, expect="any", name="auto", guessed=guessed)]
         except AutoCaseError as e:
+            if why and not opts.confirm_side_effects:
+                return None, side_effect_detail  # the side effect matters more than the args
+            if isinstance(e, PlaceholderError):
+                return None, f"Not called: {e}. Pass your own with --args '{{...}}'."
             return None, (f"Not called: could not build valid args ({e}). "
                           "Pass your own with --args '{...}'.")
-    why = side_effect_reason(tool, opts.auto_deny)
     if why and not opts.confirm_side_effects and not (opts.confirm and opts.confirm(name, why, cases[0].args)):
-        return None, (f"Not called: {why}, so it may change data. To call it anyway, run it on its own "
-                      "and confirm (--confirm-side-effects).")
+        return None, side_effect_detail
     return cases, ""
 
 
@@ -430,6 +436,8 @@ async def _call(session: CapturingSession, tool: dict[str, Any], case: Case, lab
     name, schema = tool["name"], tool.get("outputSchema")
     session.last_raw = None
     data: dict[str, Any] = {"args": case.args, "expect": case.expect, "output_schema": schema}
+    if case.guessed:
+        data["guessed_args"] = case.guessed
     t0 = time.perf_counter()
     result, exc = None, None
     try:
@@ -484,6 +492,7 @@ async def _call(session: CapturingSession, tool: dict[str, Any], case: Case, lab
                 data["null_sweep_source"] = source
 
     def row(status: str, detail: str) -> Row:
+        detail += guessed_note(case.guessed)
         if data["request_ids"]:
             detail += f" [{', '.join(data['request_ids'][:3])}]"
         return Row(name, label, status, ms, mask(detail), mask(data))

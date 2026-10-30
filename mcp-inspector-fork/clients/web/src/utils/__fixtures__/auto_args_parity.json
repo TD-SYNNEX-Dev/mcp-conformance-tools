@@ -1,0 +1,644 @@
+{
+  "today": "2026-10-30",
+  "args": [
+    {
+      "name": "description enum + date formats",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "endDate": {
+            "type": "string",
+            "description": "Invoice end date filter (yyyy-MM-dd). Required."
+          },
+          "scope": {
+            "type": "string",
+            "description": "Enum: invoices, charges. Use charges for line items."
+          },
+          "startDate": {
+            "type": "string",
+            "description": "Invoice start date (yyyy-MM-dd)."
+          }
+        },
+        "required": [
+          "endDate",
+          "scope",
+          "startDate"
+        ]
+      },
+      "args": {
+        "endDate": "2026-10-30",
+        "scope": "invoices",
+        "startDate": "2026-10-30"
+      },
+      "guessed": [
+        {
+          "path": "endDate",
+          "value": "2026-10-30",
+          "source": "description date format yyyy-MM-dd"
+        },
+        {
+          "path": "scope",
+          "value": "invoices",
+          "source": "description lists allowed values"
+        },
+        {
+          "path": "startDate",
+          "value": "2026-10-30",
+          "source": "description date format yyyy-MM-dd"
+        }
+      ]
+    },
+    {
+      "name": "upper-case date token, pair",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "StartDate": {
+            "type": "string",
+            "description": "Range start (YYYY-MM-DD)."
+          },
+          "EndDate": {
+            "type": "string",
+            "description": "Range end (YYYY-MM-DD)."
+          }
+        },
+        "required": [
+          "StartDate",
+          "EndDate"
+        ]
+      },
+      "args": {
+        "StartDate": "2026-10-30",
+        "EndDate": "2026-10-30"
+      },
+      "guessed": [
+        {
+          "path": "StartDate",
+          "value": "2026-10-30",
+          "source": "description date format YYYY-MM-DD"
+        },
+        {
+          "path": "EndDate",
+          "value": "2026-10-30",
+          "source": "description date format YYYY-MM-DD"
+        }
+      ]
+    },
+    {
+      "name": "other date tokens",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string",
+            "description": "Day as dd/MM/yyyy"
+          },
+          "b": {
+            "type": "string",
+            "description": "Format MM-DD-YYYY"
+          },
+          "c": {
+            "type": "string",
+            "description": "When, as yyyy-MM-dd HH:mm:ss"
+          },
+          "d": {
+            "type": "string",
+            "description": "yyyyMMdd"
+          }
+        },
+        "required": [
+          "a",
+          "b",
+          "c",
+          "d"
+        ]
+      },
+      "args": {
+        "a": "30/10/2026",
+        "b": "10-30-2026",
+        "c": "2026-10-30 00:00:00",
+        "d": "20261030"
+      },
+      "guessed": [
+        {
+          "path": "a",
+          "value": "30/10/2026",
+          "source": "description date format dd/MM/yyyy"
+        },
+        {
+          "path": "b",
+          "value": "10-30-2026",
+          "source": "description date format MM-DD-YYYY"
+        },
+        {
+          "path": "c",
+          "value": "2026-10-30 00:00:00",
+          "source": "description date format yyyy-MM-dd HH:mm:ss"
+        },
+        {
+          "path": "d",
+          "value": "20261030",
+          "source": "description date format yyyyMMdd"
+        }
+      ]
+    },
+    {
+      "name": "date-time hints",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "An ISO 8601 timestamp."
+          },
+          "created": {
+            "type": "string",
+            "description": "Unix epoch timestamp, as a string"
+          }
+        },
+        "required": [
+          "at"
+        ]
+      },
+      "args": {
+        "at": "2026-10-30T00:00:00Z"
+      },
+      "guessed": [
+        {
+          "path": "at",
+          "value": "2026-10-30T00:00:00Z",
+          "source": "description asks for a date-time"
+        }
+      ]
+    },
+    {
+      "name": "unix timestamp is not a date-time",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "created": {
+            "type": "string",
+            "description": "Unix epoch timestamp, as a string"
+          }
+        },
+        "required": [
+          "created"
+        ]
+      },
+      "error": "can't build a realistic value for created (no enum, format, pattern, examples or description hint)"
+    },
+    {
+      "name": "names only",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "startDate": {
+            "type": "string"
+          },
+          "endTime": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string"
+          },
+          "keyword": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "startDate",
+          "endTime",
+          "updatedAt",
+          "keyword"
+        ]
+      },
+      "args": {
+        "startDate": "2026-10-30",
+        "endTime": "2026-10-30T00:00:00Z",
+        "updatedAt": "2026-10-30T00:00:00Z",
+        "keyword": "test"
+      },
+      "guessed": [
+        {
+          "path": "startDate",
+          "value": "2026-10-30",
+          "source": "name suggests a date"
+        },
+        {
+          "path": "endTime",
+          "value": "2026-10-30T00:00:00Z",
+          "source": "name suggests a date-time"
+        },
+        {
+          "path": "updatedAt",
+          "value": "2026-10-30T00:00:00Z",
+          "source": "name suggests a date-time"
+        },
+        {
+          "path": "keyword",
+          "value": "test",
+          "source": "name suggests free text"
+        }
+      ]
+    },
+    {
+      "name": "from/to pair",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "from": {
+            "type": "string",
+            "description": "First day, yyyy-MM-dd"
+          },
+          "to": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "from",
+          "to"
+        ]
+      },
+      "args": {
+        "from": "2026-10-30",
+        "to": "2026-10-30"
+      },
+      "guessed": [
+        {
+          "path": "from",
+          "value": "2026-10-30",
+          "source": "description date format yyyy-MM-dd"
+        },
+        {
+          "path": "to",
+          "value": "2026-10-30",
+          "source": "range pair with from"
+        }
+      ]
+    },
+    {
+      "name": "allowed values variants",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "sort": {
+            "type": "string",
+            "description": "Sort order. One of the following: asc, desc"
+          },
+          "kind": {
+            "type": "string",
+            "description": "Allowed values are 'open' | 'closed'."
+          },
+          "mode": {
+            "type": "string",
+            "description": "Possible values: fast or slow"
+          }
+        },
+        "required": [
+          "sort",
+          "kind",
+          "mode"
+        ]
+      },
+      "args": {
+        "sort": "asc",
+        "kind": "open",
+        "mode": "fast"
+      },
+      "guessed": [
+        {
+          "path": "sort",
+          "value": "asc",
+          "source": "description lists allowed values"
+        },
+        {
+          "path": "kind",
+          "value": "open",
+          "source": "description lists allowed values"
+        },
+        {
+          "path": "mode",
+          "value": "fast",
+          "source": "description lists allowed values"
+        }
+      ]
+    },
+    {
+      "name": "anyOf with hint on parent",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "order": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "string"
+              }
+            ],
+            "description": "Valid values: asc, desc"
+          }
+        },
+        "required": [
+          "order"
+        ]
+      },
+      "args": {
+        "order": "asc"
+      },
+      "guessed": [
+        {
+          "path": "order",
+          "value": "asc",
+          "source": "description lists allowed values"
+        }
+      ]
+    },
+    {
+      "name": "oneOf prefers a realistic option",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer",
+                "minimum": 3
+              }
+            ]
+          }
+        },
+        "required": [
+          "id"
+        ]
+      },
+      "args": {
+        "id": 3
+      },
+      "guessed": []
+    },
+    {
+      "name": "schema keywords",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "region": {
+            "type": "string",
+            "enum": [
+              null,
+              "US",
+              "CA"
+            ]
+          },
+          "ex": {
+            "type": "string",
+            "examples": [
+              null,
+              "x1"
+            ]
+          },
+          "c": {
+            "const": 7
+          },
+          "d": {
+            "type": "string",
+            "default": "dflt"
+          },
+          "email": {
+            "type": "string",
+            "format": "email"
+          },
+          "uuid": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "day": {
+            "type": "string",
+            "format": "date"
+          },
+          "when": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "n": {
+            "type": "integer",
+            "exclusiveMinimum": 0,
+            "multipleOf": 5
+          },
+          "m": {
+            "type": "number",
+            "maximum": 0
+          },
+          "flag": {
+            "type": "boolean"
+          },
+          "sku": {
+            "type": "string",
+            "pattern": "^[A-Z]{2}-\\d{4}$"
+          },
+          "code": {
+            "type": "string",
+            "pattern": "^(foo|bar)_[a-z]+$"
+          },
+          "opt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "region",
+          "ex",
+          "c",
+          "d",
+          "email",
+          "uuid",
+          "day",
+          "when",
+          "n",
+          "m",
+          "flag",
+          "sku",
+          "code"
+        ]
+      },
+      "args": {
+        "region": "US",
+        "ex": "x1",
+        "c": 7,
+        "d": "dflt",
+        "email": "test@example.com",
+        "uuid": "00000000-0000-4000-8000-000000000000",
+        "day": "2026-10-30",
+        "when": "2026-10-30T00:00:00Z",
+        "n": 5,
+        "m": 0,
+        "flag": false,
+        "sku": "AA-0000",
+        "code": "foo_a"
+      },
+      "guessed": []
+    },
+    {
+      "name": "nested and arrays",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "object",
+            "properties": {
+              "region": {
+                "type": "string",
+                "description": "Allowed values: US, CA"
+              }
+            },
+            "required": [
+              "region"
+            ]
+          },
+          "ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9]{3}$"
+            }
+          }
+        },
+        "required": [
+          "filter",
+          "ids"
+        ]
+      },
+      "args": {
+        "filter": {
+          "region": "US"
+        },
+        "ids": [
+          "000"
+        ]
+      },
+      "guessed": [
+        {
+          "path": "filter.region",
+          "value": "US",
+          "source": "description lists allowed values"
+        }
+      ]
+    },
+    {
+      "name": "placeholder skip",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "record_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "record_id",
+          "name",
+          "limit"
+        ]
+      },
+      "error": "can't build a realistic value for record_id, name (no enum, format, pattern, examples or description hint)"
+    },
+    {
+      "name": "unsupported pattern skip",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "sku": {
+            "type": "string",
+            "pattern": "^(?=A)[A-Z]+$"
+          }
+        },
+        "required": [
+          "sku"
+        ]
+      },
+      "error": "can't generate a value for sku that matches its pattern \"^(?=A)[A-Z]+$\""
+    },
+    {
+      "name": "optional fields stay omitted",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "note": {
+            "type": "string"
+          }
+        },
+        "required": []
+      },
+      "args": {},
+      "guessed": []
+    }
+  ],
+  "lint": [
+    {
+      "name": "enum and date hints",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "scope": {
+            "type": "string",
+            "description": "Enum: invoices, charges."
+          },
+          "day": {
+            "type": "string",
+            "description": "Day (yyyy-MM-dd)."
+          },
+          "at": {
+            "type": "string",
+            "description": "ISO 8601 date-time"
+          },
+          "ok": {
+            "type": "string",
+            "description": "Day (yyyy-MM-dd).",
+            "format": "date"
+          },
+          "ok2": {
+            "type": "string",
+            "enum": [
+              "a"
+            ],
+            "description": "Enum: a, b"
+          }
+        },
+        "required": [
+          "scope",
+          "day",
+          "at",
+          "ok",
+          "ok2"
+        ]
+      },
+      "findings": [
+        {
+          "severity": "warn",
+          "path": "/properties/scope/description",
+          "message": "The description lists allowed values (\"invoices\", \"charges\"), but the schema has no \"enum\", so clients and test tools can't see them. Fix: add \"enum\": [\"invoices\", \"charges\"]."
+        },
+        {
+          "severity": "warn",
+          "path": "/properties/day/description",
+          "message": "The description asks for a date (yyyy-MM-dd), but the schema has no \"format\" or \"pattern\", so clients and test tools can't see it. Fix: add \"format\": \"date\" (or a \"pattern\")."
+        },
+        {
+          "severity": "warn",
+          "path": "/properties/at/description",
+          "message": "The description asks for a date-time, but the schema has no \"format\" or \"pattern\", so clients and test tools can't see it. Fix: add \"format\": \"date-time\" (or a \"pattern\")."
+        }
+      ]
+    }
+  ]
+}

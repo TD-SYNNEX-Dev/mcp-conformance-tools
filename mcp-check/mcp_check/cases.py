@@ -28,6 +28,7 @@ class Case:
     args: dict[str, Any] = field(default_factory=dict)
     expect: str = "success"  # success | error | any (any = auto-case: only a schema mismatch FAILs)
     name: str | None = None
+    guessed: list[dict[str, Any]] = field(default_factory=list)  # auto-cases: values guessed from a description/name
 
 
 class CasesError(ValueError):

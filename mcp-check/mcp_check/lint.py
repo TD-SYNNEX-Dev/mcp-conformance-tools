@@ -3,7 +3,8 @@
 Severities:
   error - the schema is not valid JSON Schema, or breaks an MCP rule (root must be "type": "object")
   warn  - OpenAPI-only keywords that JSON Schema validators silently ignore (e.g. `nullable`),
-          and tool names with characters some clients reject
+          tool names with characters some clients reject, and (input schema only) string fields
+          whose description lists allowed values or a date format the schema itself does not state
   info  - required properties whose type does not allow null; if the server ever sends null
           for one of these, a strict client (like the Python SDK) rejects the whole result
 
@@ -12,6 +13,7 @@ Messages are plain sentences ending in "Fix: ..."; conformanceRules.ts uses the 
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import asdict, dataclass
 from typing import Any, Iterator
@@ -20,6 +22,7 @@ from jsonschema import SchemaError
 from jsonschema.validators import validator_for
 
 from mcp_check.explain import js, type_list_json
+from mcp_check.hints import date_format_hint, datetime_hint, enum_hint
 
 # Keywords that exist in OpenAPI 3.0 Schema Objects but not in JSON Schema 2020-12 -> the fix.
 OPENAPI_ONLY = {
@@ -160,6 +163,8 @@ def lint_schema(kind: str, schema: Any) -> list[Finding]:
         for kw in OPENAPI_ONLY:
             if kw in node and not (kw == "xml" and path.endswith("/properties")):
                 out.append(Finding(kind, "warn", f"{path}/{kw}", openapi_message(kw, node[kw], node)))
+        if kind == "inputSchema":
+            out += _hint_findings(kind, path, node)
         req = node.get("required")
         props = node.get("properties")
         if isinstance(req, list) and isinstance(props, dict):
@@ -170,6 +175,36 @@ def lint_schema(kind: str, schema: Any) -> list[Finding]:
                     out.append(Finding(kind, "info", f"{path}/properties/{_esc(name)}",
                                        f'Required field "{name}" can\'t be null (type {js(t)}).'))
     return out
+
+
+def _is_string(node: dict[str, Any]) -> bool:
+    t = node.get("type")
+    return t == "string" or (isinstance(t, list) and "string" in t)
+
+
+def _hint_findings(kind: str, path: str, node: dict[str, Any]) -> list[Finding]:
+    """Description-only constraints: allowed values or a date format the schema doesn't state."""
+    desc = node.get("description")
+    if not isinstance(desc, str) or not _is_string(node) or "enum" in node or "const" in node:
+        return []
+    vals = enum_hint(desc)
+    if vals:
+        listed = ", ".join(json.dumps(v) for v in vals)
+        return [Finding(kind, "warn", f"{path}/description",
+                        f'The description lists allowed values ({listed}), but the schema has no "enum", so '
+                        f'clients and test tools can\'t see them. Fix: add "enum": [{listed}].')]
+    if "format" in node or "pattern" in node:
+        return []
+    dh = date_format_hint(desc)
+    if dh:
+        what, fmt = dh[0], f" ({dh[1]}{dh[2]})"
+    elif datetime_hint(desc):
+        what, fmt = "date-time", ""
+    else:
+        return []
+    return [Finding(kind, "warn", f"{path}/description",
+                    f'The description asks for a {what}{fmt}, but the schema has no "format" or "pattern", so '
+                    f'clients and test tools can\'t see it. Fix: add "format": "{what}" (or a "pattern").')]
 
 
 def lint_tool(tool: dict[str, Any]) -> list[Finding]:

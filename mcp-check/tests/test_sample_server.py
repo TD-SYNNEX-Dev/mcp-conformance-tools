@@ -66,7 +66,10 @@ def test_auto_allow_restricts_and_default_is_off(sample_server, tmp_path: Path):
     p = run_check(f"{base}/mcp", "--auto-cases", "--auto-allow", "healthy_tool,delete_*", "--json", str(out))
     assert p.returncode == 0, p.stdout + p.stderr
     rows = rows_by(json.loads(out.read_text()))
-    assert rows[("healthy_tool", "call[auto]")]["status"] == "PASS"
+    ok = rows[("healthy_tool", "call[auto]")]
+    assert ok["status"] == "PASS"  # a guessed value is noted, the grade is unchanged
+    assert ok["data"]["guessed_args"] == [{"path": "query", "value": "test", "source": "name suggests free text"}]
+    assert 'Values guessed from the description or name: query = "test" (name suggests free text).' in ok["detail"]
     assert "it is not in the auto-allow list" in rows[("nullable_keyword", "call")]["detail"]
     assert "suggests side effects" in rows[("delete_record", "call")]["detail"]  # allowlist can't override
     assert log.read_text().split() == ["healthy_tool"]

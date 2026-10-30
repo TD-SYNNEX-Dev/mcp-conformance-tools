@@ -12,7 +12,12 @@ import {
   evaluateCall,
   lintRow,
   lintTool,
+  buildAutoArgs,
+  generatedArgsText,
+  guessedNote,
+  lintSchema,
   minimalArgs,
+  patternSample,
   schemaIssues,
   sideEffectReason,
   nullSweep,
@@ -24,6 +29,8 @@ import {
   type ToolLike,
 } from "./conformanceRules";
 import { mismatchDetail } from "./conformanceExplain";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 const input = {
   type: "object",
@@ -299,17 +306,20 @@ describe("auto-cases", () => {
   it("builds minimal valid args", () => {
     expect(minimalArgs(input)).toEqual({ keyword: "test" });
     expect(
-      minimalArgs({
-        type: "object",
-        properties: {
-          d: { type: "string", format: "date" },
-          n: { type: "integer", minimum: 3 },
-          e: { enum: ["x", "y"] },
-          l: { type: "array", minItems: 1, items: { type: "boolean" } },
-          opt: { type: "string" },
+      minimalArgs(
+        {
+          type: "object",
+          properties: {
+            d: { type: "string", format: "date" },
+            n: { type: "integer", minimum: 3 },
+            e: { enum: ["x", "y"] },
+            l: { type: "array", minItems: 1, items: { type: "boolean" } },
+            opt: { type: "string" },
+          },
+          required: ["d", "n", "e", "l"],
         },
-        required: ["d", "n", "e", "l"],
-      }),
+        { today: "2026-01-01" },
+      ),
     ).toEqual({ d: "2026-01-01", n: 3, e: "x", l: [false] });
   });
 
@@ -318,12 +328,24 @@ describe("auto-cases", () => {
       name: "t",
       inputSchema: {
         type: "object",
-        properties: { a: { type: "string", pattern: "^[0-9]+$" } },
+        properties: { a: { type: "string", pattern: "^(?=9)[0-9]+$" } },
         required: ["a"],
       },
     });
     expect(r.testCase).toBeNull();
-    expect(r.reason).toContain("do not validate");
+    expect(r.reason).toContain("could not build valid args");
+    expect(r.reason).toContain("matches its pattern");
+    const tooLong = autoCase({
+      name: "t",
+      inputSchema: {
+        type: "object",
+        properties: {
+          a: { type: "string", pattern: "^[0-9]{8}$", maxLength: 4 },
+        },
+        required: ["a"],
+      },
+    });
+    expect(tooLong.reason).toContain("do not validate");
   });
 
   it("auto-case errors are WARN, not FAIL", () => {
@@ -380,5 +402,129 @@ describe("coverage + export", () => {
     const out = buildExport({ tools, rows });
     expect(out.result).toBe("PASS");
     expect(out.coverage).toEqual(cov);
+  });
+});
+
+// --------------------------------------------------------------------- realistic auto-case values
+// __fixtures__/auto_args_parity.json is a byte-for-byte copy of mcp-check's
+// tests/auto_args_parity.json (mcp-check's tests check that), so the CLI and
+// the Conformance tab build the same args and lint the same way.
+interface ParityFixture {
+  today: string;
+  args: Array<{
+    name: string;
+    schema: unknown;
+    args?: Record<string, unknown>;
+    guessed?: unknown[];
+    error?: string;
+  }>;
+  lint: Array<{ name: string; schema: unknown; findings: unknown[] }>;
+}
+const PARITY = JSON.parse(
+  readFileSync(
+    join(import.meta.dirname, "__fixtures__", "auto_args_parity.json"),
+    "utf8",
+  ),
+) as ParityFixture;
+
+describe("auto-case values (parity fixture with mcp-check)", () => {
+  it.each(PARITY.args.map((c) => [c.name, c] as const))("%s", (_, fx) => {
+    if (fx.error !== undefined)
+      expect(() => buildAutoArgs(fx.schema, { today: PARITY.today })).toThrow(
+        fx.error,
+      );
+    else
+      expect(buildAutoArgs(fx.schema, { today: PARITY.today })).toEqual({
+        args: fx.args,
+        guessed: fx.guessed,
+      });
+  });
+
+  it.each(PARITY.lint.map((c) => [c.name, c] as const))("lint: %s", (_, fx) => {
+    const got = lintSchema("inputSchema", fx.schema)
+      .filter((f) => f.severity !== "info")
+      .map(({ severity, path, message }) => ({ severity, path, message }));
+    expect(got).toEqual(fx.findings);
+    expect(
+      lintSchema("outputSchema", fx.schema).filter(
+        (f) => f.severity === "warn",
+      ),
+    ).toEqual([]);
+  });
+
+  it("PRD-style billing tool gets realistic args, marked as guessed", () => {
+    const tool: ToolLike = {
+      name: "get_billing_summary",
+      inputSchema: {
+        type: "object",
+        properties: {
+          startDate: {
+            type: "string",
+            description: "Start date filter (yyyy-MM-dd).",
+          },
+          endDate: {
+            type: "string",
+            description: "End date filter (yyyy-MM-dd).",
+          },
+          scope: {
+            type: "string",
+            description: "Enum: invoices, charges. Use charges for line items.",
+          },
+          limit: { type: "integer" },
+        },
+        required: ["startDate", "endDate", "scope"],
+      },
+    };
+    const r = autoCase(tool);
+    const today = new Date().toISOString().slice(0, 10);
+    expect(r.reason).toBe("");
+    expect(r.testCase?.args).toEqual({
+      startDate: today,
+      endDate: today,
+      scope: "invoices",
+    });
+    const rows = evaluateCall(tool, r.testCase as TestCase, "call[auto]", {
+      kind: "result",
+      result: { isError: true, content: [{ type: "text", text: "bad" }] },
+    });
+    expect(rows[0].status).toBe(WARN); // grading unchanged
+    expect(rows[0].data?.guessed_args).toEqual(r.testCase?.guessed);
+    expect(rows[0].detail).toContain(
+      `Values guessed from the description or name: startDate = "${today}" (description date format yyyy-MM-dd)`,
+    );
+  });
+
+  it("skips a required field that would only get the placeholder, naming it", () => {
+    const tool: ToolLike = {
+      name: "get_thing",
+      inputSchema: {
+        type: "object",
+        properties: { thing_id: { type: "string" }, note: { type: "string" } },
+        required: ["thing_id"],
+      },
+    };
+    expect(autoCase(tool)).toEqual({
+      testCase: null,
+      reason:
+        "it can't build a realistic value for thing_id (no enum, format, pattern, examples or description hint)",
+    });
+    // the single-tool editor still pre-fills something you can edit
+    expect(JSON.parse(generatedArgsText(tool))).toEqual({ thing_id: "test" });
+    expect(guessedNote([])).toBe("");
+  });
+
+  it.each([
+    ["^[0-9]{8}$", "00000000"],
+    ["^[A-Z]{2}-\\d{4}$", "AA-0000"],
+    ["^(foo|bar)_[a-z]+$", "foo_a"],
+    ["^[^0-9]+$", "a"],
+    ["\\.json$", ".json"],
+    ["^(?:ab){2,3}c?$", "abab"],
+    ["^\\w+@\\w+\\.com$", "a@a.com"],
+    ["^(?=a)", null],
+    ["(a)\\1", null],
+    ["^\\p{L}+$", null],
+  ])("pattern sample %s", (pattern, sample) => {
+    expect(patternSample(pattern)).toBe(sample);
   });
 });

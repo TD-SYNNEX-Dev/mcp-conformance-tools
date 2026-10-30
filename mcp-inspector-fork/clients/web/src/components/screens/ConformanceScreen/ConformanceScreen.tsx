@@ -32,6 +32,7 @@ import {
   coverageLine,
   evaluateCall,
   lintRow,
+  generatedArgs,
   generatedArgsText,
   NO_CASE_DETAIL,
   notCalledDetail,
@@ -296,6 +297,7 @@ export function ConformanceScreen({
               name: "auto",
               args: args as Record<string, unknown>,
               expect: "any",
+              guessed: generatedArgs(tool).guessed,
             },
           ];
 
